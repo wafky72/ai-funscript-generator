@@ -1,0 +1,29 @@
+{
+  "addons": {
+    "device_control": {
+      "version": "5.7.6",
+      "display_name": "Device Control",
+      "changelog": "Parity helpers (TCode UDP/TCP backends, dirty dedupe, sync ramp, smart limit, auto-reconnect), multi-instance backend support, addons_common shared package"
+    },
+    "streamer": {
+      "version": "3.7.2",
+      "display_name": "Video Streamer",
+      "changelog": "Loop-safe aiohttp session: recreate per running loop so XBVR/Stash scene fetch no longer fails with 'Timeout context manager should be used inside a task' when the HereSphere bridge loop reuses the sync server's session"
+    },
+    "subtitle_translation": {
+      "version": "1.0.5",
+      "display_name": "Subtitle Translation",
+      "changelog": "CUDA/CPU large tier now uses the uncensored Orion-zhen/Qwen2.5-7B-Instruct-Uncensored (the same source the MLX large model is converted from), so Windows/Linux users stop getting the censored model at the best setting. Also pre-fetches the translation LLM before going offline so the first Generate on a clean install no longer fails"
+    },
+    "addons_common": {
+      "version": "0.1.1",
+      "display_name": "Addons Common",
+      "changelog": "Shared package: ServiceState, BackgroundJob, cleanup_old_files, RateLimiter, SpeedLimiter, AddonStatus registry"
+    },
+    "patreon_features": {
+      "version": "1.1.4",
+      "display_name": "Patreon Features",
+      "changelog": "UI form factor unification"
+    }
+  }
+}
