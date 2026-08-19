@@ -1,0 +1,6 @@
+# NVIDIA driver 550-559 (Debian Trixie, Bookworm-backports). cu124 wheels.
+--index-url https://download.pytorch.org/whl/cu124
+--extra-index-url https://pypi.org/simple
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+torchaudio==2.6.0+cu124
