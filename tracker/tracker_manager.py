@@ -1,0 +1,1251 @@
+"""
+Tracker manager that directly interfaces with modular trackers.
+Replaces ModularTrackerBridge with clean, scalable architecture.
+"""
+import logging
+import time
+import numpy as np
+from typing import List, Dict, Tuple, Optional, Any
+
+from config.constants import POSITION_INFO_MAPPING
+from tracker.tracker_modules import tracker_registry
+from funscript.multi_axis_funscript import MultiAxisFunscript
+
+
+class TrackerManager:
+    """
+    Native modular tracker manager with direct instantiation.
+    No bridge layers - direct communication between GUI and trackers.
+    """
+    
+    def __init__(self, app_logic_instance: Optional[Any], tracker_model_path: str):
+        self.app = app_logic_instance
+        self.tracker_model_path = tracker_model_path
+        
+        # Set up logger
+        if app_logic_instance and hasattr(app_logic_instance, 'logger'):
+            self.logger = app_logic_instance.logger
+        else:
+            self.logger = logging.getLogger('NativeTrackerManager')
+            
+        # Current tracker instance and metadata
+        self._current_tracker = None
+        self._current_mode = None
+        self._tracker_info = None
+        from config.tracker_discovery import get_tracker_discovery
+        self._discovery = get_tracker_discovery()
+        
+        # Create funscript instance for accumulating tracking data
+        self.funscript = MultiAxisFunscript(logger=self.logger)
+        self._apply_axis_settings(app_logic_instance)
+
+        # Preserve full TrackerResult for multi-axis extraction
+        self._last_tracker_result = None
+
+        # Apply point simplification setting from app settings
+        if app_logic_instance and hasattr(app_logic_instance, 'app_settings'):
+            _fs_cfg = app_logic_instance.app_settings.config.funscript
+            self.funscript.enable_point_simplification = _fs_cfg.point_simplification_enabled
+            self.funscript.simplification_tolerance = _fs_cfg.point_simplification_tolerance
+        
+        # Tracking state
+        self.tracking_active = False
+        self.current_fps = 0.0
+
+        # Background preload: when set_tracking_mode(lazy=True) stages a
+        # tracker, we spawn a thread that runs initialize() in the
+        # background so start_tracking() doesn't have to block the UI.
+        self._preload_thread = None
+
+        # Pending configurations (applied when tracker is instantiated)
+        self._pending_axis_A = None
+        self._pending_axis_B = None
+        self._pending_user_roi = None
+        self._pending_user_point = None
+        
+        # UI visualization state (for GUI compatibility)
+        self.show_all_boxes = False
+        
+        # Device control integration (subscriber feature)
+        self.device_bridge = None
+        self.live_device_control_enabled = False  # User toggle
+        self._init_device_bridge()
+        self.show_flow = False
+        self.show_stats = False
+        self.show_funscript_preview = False
+        self.show_masks = False
+        self.show_roi = False
+        self.show_grid_blocks = False
+        
+        # Current ROI for visualization overlay
+        self.roi = None
+
+        # Live overlay data (proxied from inner tracker for ImGui rendering)
+        self.live_overlay = {}
+        # Debug frame: optional numpy array (BGR) for a separate debug window
+        self.debug_frame = None
+        
+        # Additional GUI compatibility attributes that were in the old bridge
+        self.oscillation_area_fixed = None  # Should be None or (x, y, w, h) tuple
+        self.user_roi_fixed = None  # Should be None or (x, y, w, h) tuple
+        self.main_interaction_class = None
+        self.confidence_threshold = 0.7
+        
+        # Model paths for GUI compatibility (set by control panel when models change)
+        self.det_model_path = self.tracker_model_path  # Detection model path
+        self.pose_model_path = None  # Pose model path (if used)
+        
+        # Live tracker GUI compatibility attributes
+        self.enable_inversion_detection = False  # Motion mode feature
+        self.motion_mode = "normal"  # Motion mode state
+        self.roi_padding = 50
+        self.roi_update_interval = 10
+        self.roi_smoothing_factor = 0.1
+        self.max_frames_for_roi_persistence = 30
+        self.use_sparse_flow = False
+        self.sensitivity = 1.0
+        self.base_amplification_factor = 1.0
+        self.class_specific_amplification_multipliers = {}
+        self.flow_history_window_smooth = 10
+        self.y_offset = 0  # Y-axis offset for positioning
+        self.x_offset = 0  # X-axis offset for positioning  
+        self.internal_frame_counter = 0  # Frame counter for processing
+        
+        # Additional properties that modular trackers might expect
+        self.oscillation_history = {}  # Dictionary for oscillation trackers
+        self.user_roi_current_flow_vector = (0.0, 0.0)  # For user ROI trackers
+        self.user_roi_initial_point_relative = None
+        self.user_roi_tracked_point_relative = None
+
+        # More oscillation tracker properties
+        self.oscillation_cell_persistence = {}  # Dictionary for cell persistence
+        self._gray_full_buffer = None  # Gray frame buffer
+        self.prev_gray = None  # Previous gray frame
+        self.prev_gray_oscillation = None  # Previous gray frame for oscillation detection
+        self.grid_size = (8, 8)  # Grid size for oscillation detection
+        self.oscillation_grid_size = 8  # Integer for compatibility
+        self.oscillation_threshold = 0.5  # Oscillation detection threshold
+        self.initialized = False  # Tracker initialization status
+
+        # Rolling Ultimate Autotune for live tracking (streamer mode)
+        # Load from settings if app instance is available (disabled by default, requires streamer + connected session)
+        if app_logic_instance and hasattr(app_logic_instance, 'app_settings'):
+            _cfg = app_logic_instance.app_settings.config.tracking
+            self.rolling_autotune_enabled = _cfg.live_rolling_autotune_enabled
+            self.rolling_autotune_interval_ms = _cfg.live_rolling_autotune_interval_ms
+            self.rolling_autotune_window_ms = _cfg.live_rolling_autotune_window_ms
+        else:
+            self.rolling_autotune_enabled = False  # Disabled by default - requires streamer with connected session
+            self.rolling_autotune_interval_ms = 5000  # Apply autotune every 5 seconds
+            self.rolling_autotune_window_ms = 5000  # Process last 5 seconds of data
+        self.rolling_autotune_last_time = 0  # Last time autotune was applied
+
+        self.logger.debug("TrackerManager initialized - Direct modular tracker interface")
+
+    def set_tracking_mode(self, mode_name: str, lazy: bool = False,
+                          preload: bool = True) -> bool:
+        """Set tracking mode with direct tracker instantiation.
+
+        When ``lazy`` is True, the tracker object is instantiated and axes are
+        assigned, but the potentially-heavy ``initialize()`` call (YOLO model
+        load, warmup forward, etc.) is deferred until ``start_tracking()`` or
+        an explicit ``ensure_initialized()``. Useful at startup so users who
+        never hit Play don't pay the load cost (saves 1-2 s of cold-start).
+        """
+        try:
+            if mode_name == self._current_mode and self._current_tracker:
+                self.logger.debug(f"Already using tracker mode: {mode_name}")
+                return True
+                
+            # Clean up previous tracker
+            self._cleanup_current_tracker()
+            
+            # Get tracker info and class
+            tracker_info = self._discovery.get_tracker_info(mode_name)
+            if not tracker_info:
+                self.logger.error(f"Unknown tracker mode: {mode_name}")
+                return False
+                
+            # Use internal name from tracker_info (resolves aliases like "oscillation" -> "LIVE_OSCILLATION")
+            tracker_class = tracker_registry.get_tracker(tracker_info.internal_name)
+            if not tracker_class:
+                self.logger.error(f"Could not load tracker class for: {mode_name}")
+                return False
+                
+            # Direct instantiation - no bridge layer
+            self._current_tracker = tracker_class()
+            self._current_mode = mode_name
+            self._tracker_info = tracker_info
+
+            # Apply tracker's declared axis assignments to the funscript.
+            # The secondary axis can be overridden by the user's setting
+            # (e.g. "twist" instead of "roll" for SSR2 users).
+            if self.funscript and tracker_info:
+                self.funscript.assign_axis(1, tracker_info.primary_axis)
+                if tracker_info.supports_dual_axis:
+                    secondary = tracker_info.secondary_axis
+                    if self.app and hasattr(self.app, 'app_settings'):
+                        user_secondary = self.app.app_settings.config.performance.default_secondary_axis
+                        if user_secondary and user_secondary != secondary:
+                            self.logger.info(f"Using user-configured secondary axis: {user_secondary} (tracker default: {secondary})")
+                            secondary = user_secondary
+                    self.funscript.assign_axis(2, secondary)
+
+                # Auto-assign additional axes (T3+) declared by the tracker
+                if tracker_info.additional_axes:
+                    for i, axis_name in enumerate(tracker_info.additional_axes):
+                        tl_num = 3 + i
+                        self.funscript.assign_axis(tl_num, axis_name)
+                        self.funscript.ensure_axis(axis_name)
+
+            # Set up tracker with app and model path
+            self._setup_tracker_environment()
+
+            # Initialize tracker now or defer to first use.
+            if lazy:
+                self._pending_initialize = True
+                self.logger.debug(f"Tracker {mode_name} staged (lazy init); model load deferred.")
+                if preload:
+                    self._start_preload_async()
+            else:
+                self._pending_initialize = False
+                if not self._initialize_tracker():
+                    return False
+
+            # Apply any pending configurations
+            self._apply_pending_configurations()
+
+            self.logger.debug(f"Native tracker instantiated: {mode_name} ({tracker_info.display_name})")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to set tracking mode {mode_name}: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _start_preload_async(self) -> None:
+        """Run initialize() on a background thread so Start is instant."""
+        import threading as _threading
+        prev = self._preload_thread
+        if prev is not None and prev.is_alive():
+            return
+        tracker_ref = self._current_tracker
+        mode_ref = self._current_mode
+
+        def _run():
+            try:
+                if tracker_ref is not self._current_tracker:
+                    return
+                t0 = time.monotonic()
+                ok = self._initialize_tracker()
+                dt = (time.monotonic() - t0) * 1000.0
+                if ok and tracker_ref is self._current_tracker:
+                    self._pending_initialize = False
+                    self.logger.info(
+                        f"Tracker '{mode_ref}' preloaded in {dt:.0f}ms (async)")
+            except Exception as e:
+                self.logger.warning(
+                    f"Async tracker preload failed: {e}", exc_info=True)
+
+        self._preload_thread = _threading.Thread(
+            target=_run, name=f"TrackerPreload[{mode_ref}]", daemon=True)
+        self._preload_thread.start()
+
+    def ensure_initialized(self) -> bool:
+        """Force initialize() on a lazily-staged tracker. Idempotent.
+
+        Joins an in-flight async preload first so Start doesn't race it.
+        """
+        if not self._current_tracker:
+            return False
+        pre = self._preload_thread
+        if pre is not None and pre.is_alive():
+            pre.join()
+        if not getattr(self, "_pending_initialize", False):
+            return True
+        ok = self._initialize_tracker()
+        if ok:
+            self._pending_initialize = False
+        return ok
+
+    def start_tracking(self) -> bool:
+        """Start tracking with direct tracker call."""
+        if not self._current_tracker:
+            self.logger.error("No tracker set - call set_tracking_mode() first")
+            return False
+
+        try:
+            # Pay the deferred initialize cost here if set_tracking_mode was
+            # called lazily. Running it inside start_tracking keeps the user's
+            # "click Play, wait a moment, go" expectation intact.
+            if getattr(self, "_pending_initialize", False):
+                if not self.ensure_initialized():
+                    return False
+
+            # Lazy ffmpeg frame source spawn: skipped at video open when
+            # libmpv was the display, so first tracker start needs to
+            # actually warm the decoder pipe now.
+            processor = getattr(self.app, 'processor', None) if self.app else None
+            if processor is not None and hasattr(processor, '_ensure_frame_source_started'):
+                try:
+                    processor._ensure_frame_source_started()
+                except Exception as e:
+                    self.logger.debug(f"frame source warm failed: {e}")
+
+            self.tracking_active = True
+            self._suspend_mpv_display_for_tracking()
+            if hasattr(self._current_tracker, 'start_tracking'):
+                result = self._current_tracker.start_tracking()
+                return result if isinstance(result, bool) else True
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to start tracking: {e}")
+            self.tracking_active = False
+            self._resume_mpv_display_after_tracking()
+            return False
+
+    def stop_tracking(self):
+        """Stop tracking with direct tracker call.
+
+        Heavy teardown (ffmpeg filter-chain rebuild + respawn) runs on a
+        background thread so the UI click returns instantly instead of
+        freezing for seconds while the source restarts.
+        """
+        if not self._current_tracker:
+            return
+
+        try:
+            self.tracking_active = False
+            if hasattr(self._current_tracker, 'stop_tracking'):
+                self._current_tracker.stop_tracking()
+            elif hasattr(self._current_tracker, 'cleanup'):
+                self._current_tracker.cleanup()
+
+            if self.funscript and hasattr(self.funscript, 'log_final_simplification_summary'):
+                self.funscript.log_final_simplification_summary()
+
+            if self.app and hasattr(self.app, 'app_state_ui'):
+                self.app.app_state_ui.force_timeline_pan_to_current_frame = True
+
+            import threading as _threading
+            def _teardown():
+                try:
+                    self._resume_mpv_display_after_tracking()
+                except Exception as e:
+                    self.logger.warning(f"async mpv resume failed: {e}")
+            _threading.Thread(
+                target=_teardown, name="TrackerStopTeardown", daemon=True
+            ).start()
+        except Exception as e:
+            self.logger.error(f"Failed to stop tracking: {e}")
+
+    # ---------------------------------------------------- mpv display gating
+
+    def _get_mpv_display(self):
+        """Resolve the GUI's session-wide MpvDisplay (or None if absent)."""
+        if not self.app:
+            return None
+        gui = getattr(self.app, 'gui_instance', None)
+        return getattr(gui, 'mpv_display', None) if gui else None
+
+    def _suspend_mpv_display_for_tracking(self) -> None:
+        # Save paused/mute state so _resume_ can restore exactly.
+        disp = self._get_mpv_display()
+        if disp is None or not getattr(disp, 'is_loaded', False):
+            return
+        try:
+            self._mpv_pre_tracking_mute = bool(getattr(disp._player, 'mute', False)) if disp._player else False
+            self._mpv_pre_tracking_paused = bool(getattr(disp, 'is_paused', False))
+            self._mpv_suspended_by_tracker = True
+            if disp._player is not None:
+                disp._player.mute = True
+            disp.pause()
+        except Exception as e:
+            if self.logger:
+                self.logger.debug(f"mpv suspend-for-tracking failed: {e}")
+
+    def _resume_mpv_display_after_tracking(self) -> None:
+        # No-op if we never actually suspended (stop_tracking can fire during
+        # startup cleanup before any live session; resuming then would
+        # auto-start playback the user never asked for).
+        if not getattr(self, '_mpv_suspended_by_tracker', False):
+            return
+        disp = self._get_mpv_display()
+        if disp is None or not getattr(disp, 'is_loaded', False):
+            return
+        try:
+            proc = getattr(self.app, 'processor', None) if self.app else None
+            if proc and proc.fps and proc.fps > 0:
+                target_s = proc.current_frame_index / proc.fps
+                cur_s = 0.0
+                try:
+                    cur_s = float(getattr(disp, '_last_time_pos', 0.0) or 0.0)
+                except Exception:
+                    cur_s = 0.0
+                if abs(target_s - cur_s) > (1.0 / proc.fps):
+                    disp.seek(target_s, exact=True)
+            if disp._player is not None:
+                disp._player.mute = bool(getattr(self, '_mpv_pre_tracking_mute', False))
+            # Restore only what we clobbered.
+            if not getattr(self, '_mpv_pre_tracking_paused', False):
+                disp.play()
+        except Exception as e:
+            if self.logger:
+                self.logger.debug(f"mpv resume-after-tracking failed: {e}")
+        finally:
+            self._mpv_suspended_by_tracker = False
+
+    def process_frame(self, frame: np.ndarray, frame_time_ms: int,
+                     frame_index: Optional[int] = None,
+                     min_write_frame_id: Optional[int] = None) -> Tuple[np.ndarray, Optional[List[Dict]]]:
+        """Process frame with direct tracker call."""
+        if not self._current_tracker:
+            self.logger.error("No tracker set for process_frame")
+            return frame, None
+
+        try:
+            # Only copy when the tracker mutates its input frame.
+            if (not frame.flags.writeable
+                    and getattr(self._current_tracker, 'mutates_input_frame', True)):
+                frame = frame.copy()
+
+            result = self._current_tracker.process_frame(frame, frame_time_ms, frame_index)
+
+            # Handle TrackerResult object or tuple format
+            processed_frame, action_log = self._extract_result_data(result, frame)
+
+            # Compute the Not-Relevant chapter gate once per frame; both
+            # _add_actions_to_funscript and _add_multi_axis_to_funscript
+            # share the same guard and previously did the lookup twice.
+            skip_scripting = self._is_not_relevant_chapter()
+
+            self._add_actions_to_funscript(action_log, skip_scripting)
+            self._add_multi_axis_to_funscript(skip_scripting)
+
+            # Apply rolling autotune if enabled (for streamer mode)
+            if (self.rolling_autotune_enabled and
+                frame_time_ms - self.rolling_autotune_last_time >= self.rolling_autotune_interval_ms):
+                self._apply_rolling_autotune(frame_time_ms)
+                self.rolling_autotune_last_time = frame_time_ms
+
+            # Update visualization state
+            self._update_visualization_state()
+
+            return processed_frame, action_log
+            
+        except Exception as e:
+            self.logger.error(f"Error in process_frame with tracker {self._current_mode}: {e}")
+            return frame, None
+
+    def process_frame_for_oscillation(self, frame: np.ndarray, frame_time_ms: int, 
+                                    frame_index: Optional[int] = None) -> Tuple[np.ndarray, Optional[List[Dict]]]:
+        """Process frame for oscillation detection - delegates to current tracker."""
+        if not self._current_tracker:
+            self.logger.error("No tracker set - call set_tracking_mode() first")
+            return frame, None
+            
+        try:
+            if (not frame.flags.writeable
+                    and getattr(self._current_tracker, 'mutates_input_frame', True)):
+                frame = frame.copy()
+
+            result = self._current_tracker.process_frame(frame, frame_time_ms, frame_index)
+            
+            # Handle TrackerResult object or tuple format
+            processed_frame, action_log = self._extract_result_data(result, frame)
+            
+            is_oscillation = 'oscillation' in self._current_mode.lower()
+
+            # For oscillation trackers, we need to sample positions periodically
+            if is_oscillation:
+                # Oscillation trackers maintain continuous position, sample it
+                if hasattr(self._current_tracker, 'oscillation_funscript_pos'):
+                    position = self._current_tracker.oscillation_funscript_pos
+
+                    # Only add action if position changed or enough time has passed
+                    last_action = self.funscript.primary_actions[-1] if self.funscript.primary_actions else None
+                    add_action = False
+
+                    if last_action is None:
+                        add_action = True
+                    elif position != last_action['pos']:
+                        add_action = True
+                    elif frame_time_ms - last_action['at'] >= 100:
+                        add_action = True
+
+                    if add_action and self.funscript and position is not None:
+                        self.funscript.add_action(frame_time_ms, position)
+                        # Create action_log for compatibility
+                        action_log = [{'at': frame_time_ms, 'pos': position}]
+
+            skip_scripting = self._is_not_relevant_chapter()
+            if not is_oscillation:
+                self._add_actions_to_funscript(action_log, skip_scripting)
+            # Secondary and multi-axis routing for all trackers
+            self._add_multi_axis_to_funscript(skip_scripting)
+
+            return processed_frame, action_log
+
+        except Exception as e:
+            self.logger.error(f"Error in process_frame_for_oscillation: {e}")
+            return frame, None
+
+    def reset(self, reason: Optional[str] = None, **kwargs):
+        """Reset tracker with direct call."""
+        if not self._current_tracker:
+            return
+            
+        try:
+            if hasattr(self._current_tracker, 'reset'):
+                # Try with parameters first, fallback to no parameters
+                try:
+                    self._current_tracker.reset(reason=reason, **kwargs)
+                except TypeError:
+                    self._current_tracker.reset()
+        except Exception as e:
+            self.logger.error(f"Failed to reset tracker: {e}")
+
+    def cleanup(self):
+        """Clean up current tracker and manager state."""
+        self._cleanup_current_tracker()
+        video_fps = getattr(getattr(self.app, 'processor', None), 'fps', 0) if self.app else 0
+        self.funscript = MultiAxisFunscript(logger=self.logger,
+                                            fps=video_fps if video_fps > 0 else None)
+        self._apply_axis_settings(self.app)
+
+        # Reapply point simplification setting
+        if self.app and hasattr(self.app, 'app_settings'):
+            _fs_cfg = self.app.app_settings.config.funscript
+            self.funscript.enable_point_simplification = _fs_cfg.point_simplification_enabled
+            self.funscript.simplification_tolerance = _fs_cfg.point_simplification_tolerance
+
+        self.tracking_active = False
+    
+    def _apply_axis_settings(self, app_instance):
+        """Apply user's default_secondary_axis setting to the funscript."""
+        if app_instance and hasattr(app_instance, 'app_settings'):
+            sec_axis = app_instance.app_settings.config.performance.default_secondary_axis
+            if sec_axis:
+                self.funscript.assign_axis(2, sec_axis)
+
+    def update_tracker_settings(self, **kwargs) -> bool:
+        """Update current tracker settings dynamically."""
+        if not self._current_tracker:
+            self.logger.debug("No current tracker to update settings")
+            return False
+            
+        if hasattr(self._current_tracker, 'update_settings'):
+            try:
+                result = self._current_tracker.update_settings(**kwargs)
+                if result:
+                    self.logger.debug(f"Tracker settings updated successfully")
+                else:
+                    self.logger.warning("Tracker settings update failed")
+                return result
+            except Exception as e:
+                self.logger.error(f"Error updating tracker settings: {e}")
+                return False
+        else:
+            self.logger.debug(f"Tracker {type(self._current_tracker).__name__} does not support dynamic settings updates")
+            return False
+
+    # Configuration methods with direct tracker interface
+    def set_user_defined_roi_and_point(self, roi_abs_coords: Tuple[int, int, int, int], 
+                                     point_abs_coords_in_frame: Tuple[int, int], 
+                                     current_frame_for_patch: Optional[np.ndarray] = None) -> bool:
+        """Set user-defined ROI and point with direct tracker call."""
+        if self._current_tracker and hasattr(self._current_tracker, 'set_user_defined_roi_and_point'):
+            try:
+                result = self._current_tracker.set_user_defined_roi_and_point(
+                    roi_abs_coords, point_abs_coords_in_frame, current_frame_for_patch
+                )
+                if result:
+                    self.logger.info(f"User ROI set: ROI={roi_abs_coords}, Point={point_abs_coords_in_frame}")
+                    # Sync manager state for GUI compatibility
+                    self.user_roi_fixed = roi_abs_coords
+                    # Calculate relative point in ROI coordinates
+                    x_rel = point_abs_coords_in_frame[0] - roi_abs_coords[0] 
+                    y_rel = point_abs_coords_in_frame[1] - roi_abs_coords[1]
+                    self.user_roi_initial_point_relative = (x_rel, y_rel)
+                    self.user_roi_tracked_point_relative = (x_rel, y_rel)
+                else:
+                    self.logger.warning("Tracker rejected user ROI setting")
+                return result
+            except Exception as e:
+                self.logger.error(f"Error setting user ROI: {e}")
+                return False
+        else:
+            # Store for later application
+            self._pending_user_roi = roi_abs_coords
+            self._pending_user_point = point_abs_coords_in_frame
+            self.logger.info(f"Stored pending user ROI: {roi_abs_coords}, {point_abs_coords_in_frame}")
+            return True
+
+    def reconfigure_for_chapter(self, chapter) -> bool:
+        """Apply a chapter's per-chapter ROI and point to the current tracker.
+        Called during live playback when entering a chapter with user_roi_fixed."""
+        roi = getattr(chapter, 'user_roi_fixed', None)
+        point_rel = getattr(chapter, 'user_roi_initial_point_relative', None)
+        if not roi:
+            return False
+        # Convert relative point back to absolute frame coords
+        if point_rel:
+            point_abs = (int(roi[0] + point_rel[0]), int(roi[1] + point_rel[1]))
+        else:
+            # Default to center of ROI if no point stored
+            point_abs = (roi[0] + roi[2] // 2, roi[1] + roi[3] // 2)
+        self.logger.info(f"Reconfiguring tracker for chapter ROI={roi}, point={point_abs}")
+        return self.set_user_defined_roi_and_point(roi, point_abs)
+
+    def set_axis(self, point_a: Tuple[int, int], point_b: Tuple[int, int]) -> bool:
+        """Set axis points with direct tracker call."""
+        if self._current_tracker and hasattr(self._current_tracker, 'set_axis'):
+            try:
+                result = self._current_tracker.set_axis(point_a, point_b)
+                self.logger.info(f"Axis set: A={point_a}, B={point_b}")
+                return result
+            except Exception as e:
+                self.logger.error(f"Error setting axis: {e}")
+                return False
+        else:
+            # Store for later application
+            self._pending_axis_A = point_a
+            self._pending_axis_B = point_b
+            self.logger.info(f"Stored pending axis: A={point_a}, B={point_b}")
+            return True
+
+    def clear_user_defined_roi_and_point(self):
+        """Clear user ROI with direct tracker call."""
+        self._pending_user_roi = None
+        self._pending_user_point = None
+        if self._current_tracker and hasattr(self._current_tracker, 'clear_user_defined_roi_and_point'):
+            self._current_tracker.clear_user_defined_roi_and_point()
+
+    def clear_oscillation_area_and_point(self):
+        """Clear oscillation area with direct tracker call."""
+        self.oscillation_area_fixed = None
+        if self._current_tracker and hasattr(self._current_tracker, 'clear_oscillation_area_and_point'):
+            self._current_tracker.clear_oscillation_area_and_point()
+
+    def set_oscillation_area_and_point(self, area_rect_video_coords, point_video_coords, current_frame):
+        """Set oscillation area and point - delegates to current tracker."""
+        if self._current_tracker and hasattr(self._current_tracker, 'set_oscillation_area_and_point'):
+            self._current_tracker.set_oscillation_area_and_point(area_rect_video_coords, point_video_coords, current_frame)
+        elif self._current_tracker and hasattr(self._current_tracker, 'set_user_defined_roi_and_point'):
+            # Fallback for trackers that use the user-defined ROI method
+            self._current_tracker.set_user_defined_roi_and_point(area_rect_video_coords, point_video_coords, current_frame)
+        else:
+            self.logger.warning(f"Current tracker {self._current_mode} does not support setting oscillation area")
+
+    def set_oscillation_area(self, area_rect_video_coords):
+        """Set oscillation area only (no point needed) - delegates to current tracker."""
+        if self._current_tracker and hasattr(self._current_tracker, 'set_oscillation_area'):
+            self._current_tracker.set_oscillation_area(area_rect_video_coords)
+        elif self._current_tracker and hasattr(self._current_tracker, 'set_roi'):
+            # Fallback for trackers that use set_roi method
+            self._current_tracker.set_roi(area_rect_video_coords)
+        else:
+            self.logger.warning(f"Current tracker {self._current_mode} does not support setting oscillation area")
+
+    # Advanced configuration methods
+    def update_dis_flow_config(self, preset=None, finest_scale=None):
+        """Update optical flow configuration."""
+        if self._current_tracker and hasattr(self._current_tracker, 'update_dis_flow_config'):
+            self._current_tracker.update_dis_flow_config(preset=preset, finest_scale=finest_scale)
+
+    def update_oscillation_grid_size(self):
+        """Update oscillation detection grid size."""
+        if self._current_tracker and hasattr(self._current_tracker, 'update_oscillation_grid_size'):
+            self._current_tracker.update_oscillation_grid_size()
+
+    def update_oscillation_sensitivity(self):
+        """Update oscillation detection sensitivity."""
+        if self._current_tracker and hasattr(self._current_tracker, 'update_oscillation_sensitivity'):
+            self._current_tracker.update_oscillation_sensitivity()
+
+    def unload_detection_model(self):
+        """Unloads the detection model."""
+        self.logger.info("Unloading detection model.")
+        self.det_model_path = None
+        if self._current_tracker:
+            if hasattr(self._current_tracker, 'det_model_path'):
+                self._current_tracker.det_model_path = None
+            self._load_models()
+
+    def unload_pose_model(self):
+        """Unloads the pose model."""
+        self.logger.info("Unloading pose model.")
+        self.pose_model_path = None
+        if self._current_tracker:
+            if hasattr(self._current_tracker, 'pose_model_path'):
+                self._current_tracker.pose_model_path = None
+            self._load_models()
+
+    def unload_models(self):
+        """Unloads models from the current tracker by cleaning up the tracker."""
+        self.logger.info("Unloading models by cleaning up the current tracker.")
+        self._cleanup_current_tracker()
+
+    def _load_models(self):
+        """Reload models in current tracker after model paths change."""
+        if not self._current_tracker:
+            self.logger.debug("No current tracker to reload models for")
+            return
+        
+        try:
+            # Try to reinitialize the tracker if it supports model reloading
+            if hasattr(self._current_tracker, '_load_models'):
+                self._current_tracker._load_models()
+                self.logger.info(f"Models reloaded for tracker {self._current_mode}")
+            elif hasattr(self._current_tracker, 'reinitialize'):
+                self._current_tracker.reinitialize()
+                self.logger.info(f"Tracker {self._current_mode} reinitialized after model path change")
+            elif hasattr(self._current_tracker, 'initialize'):
+                # Fallback: reinitialize the tracker
+                result = self._current_tracker.initialize(self.app)
+                if result:
+                    self.logger.info(f"Tracker {self._current_mode} reinitialized successfully")
+                else:
+                    self.logger.warning(f"Tracker {self._current_mode} reinitialization failed")
+            else:
+                self.logger.info(f"Tracker {self._current_mode} does not support model reloading")
+        except Exception as e:
+            self.logger.error(f"Error reloading models for tracker {self._current_mode}: {e}")
+
+    def _is_vr_video(self) -> bool:
+        """Check if current video is VR format."""
+        # First, try to delegate to current tracker if it has the method
+        if self._current_tracker and hasattr(self._current_tracker, '_is_vr_video'):
+            try:
+                return self._current_tracker._is_vr_video()
+            except Exception as e:
+                self.logger.warning(f"Error calling tracker's _is_vr_video: {e}")
+        
+        # Fallback implementation using app video dimensions
+        try:
+            if self.app and hasattr(self.app, 'get_video_dimensions'):
+                width, height = self.app.get_video_dimensions()
+                if width and height:
+                    aspect_ratio = width / height
+                    # VR videos typically have aspect ratios >= 1.8
+                    is_vr = aspect_ratio >= 1.8
+                    self.logger.debug(f"VR detection: {width}x{height} (ratio {aspect_ratio:.2f}) -> {'VR' if is_vr else 'standard'}")
+                    return is_vr
+            
+            # Try alternative method using processor
+            if self.app and hasattr(self.app, 'processor') and self.app.processor:
+                width = getattr(self.app.processor, 'frame_width', None)
+                height = getattr(self.app.processor, 'frame_height', None)
+                if width and height:
+                    aspect_ratio = width / height
+                    is_vr = aspect_ratio >= 1.8
+                    self.logger.debug(f"VR detection (processor): {width}x{height} (ratio {aspect_ratio:.2f}) -> {'VR' if is_vr else 'standard'}")
+                    return is_vr
+        except Exception as e:
+            self.logger.warning(f"Error in VR video detection: {e}")
+        
+        # Default to non-VR if detection fails
+        return False
+
+    # Getters for current state
+    def get_current_tracker_name(self) -> Optional[str]:
+        """Get current tracker mode name."""
+        return self._current_mode
+
+    def get_current_tracker(self):
+        """Get current tracker instance."""
+        return self._current_tracker
+
+    def get_tracker_info(self):
+        """Get current tracker metadata."""
+        return self._tracker_info
+
+    def is_tracking_active(self) -> bool:
+        """Check if tracking is currently active."""
+        return self.tracking_active and self._current_tracker is not None
+
+    # Private implementation methods
+    def _cleanup_current_tracker(self):
+        """Clean up current tracker instance."""
+        if self._current_tracker and hasattr(self._current_tracker, 'cleanup'):
+            try:
+                tracker_name = getattr(self._tracker_info, 'display_name', 'Unknown') if self._tracker_info else 'Unknown'
+                self._current_tracker.cleanup()
+                self.logger.debug(f"Tracker cleaned up: {tracker_name}")
+            except Exception as e:
+                self.logger.error(f"Error cleaning up tracker: {e}")
+
+        self._current_tracker = None
+        self._current_mode = None
+        self._tracker_info = None
+
+        # Clear User ROI state so it doesn't persist across tracker switches
+        self.user_roi_fixed = None
+        self.user_roi_tracked_point_relative = None
+        self.user_roi_initial_point_relative = None
+        self.user_roi_current_flow_vector = None
+
+    def _setup_tracker_environment(self):
+        """Set up tracker environment with app context."""
+        if not self._current_tracker:
+            return
+            
+        # Set essential attributes
+        self._current_tracker.app = self.app
+        self._current_tracker.model_path = self.tracker_model_path
+        self._current_tracker.logger = self.logger
+        
+        # Provide compatibility attributes for trackers
+        self._provide_tracker_compatibility_attributes()
+
+    def _initialize_tracker(self) -> bool:
+        """Initialize tracker with error handling."""
+        if not self._current_tracker:
+            return False
+
+        try:
+            if hasattr(self._current_tracker, 'initialize'):
+                init_result = self._current_tracker.initialize(self.app, tracker_model_path=self.tracker_model_path)
+                if isinstance(init_result, bool) and not init_result:
+                    self.logger.error(f"Tracker {self._current_mode} initialization failed")
+                    return False
+            return True
+        except Exception as e:
+            self.logger.error(f"Error initializing tracker {self._current_mode}: {e}")
+            return False
+
+    def _apply_pending_configurations(self):
+        """Apply any pending configurations to the tracker."""
+        if not self._current_tracker:
+            return
+            
+        # Apply pending axis settings
+        if self._pending_axis_A is not None and self._pending_axis_B is not None:
+            if hasattr(self._current_tracker, 'set_axis'):
+                try:
+                    result = self._current_tracker.set_axis(self._pending_axis_A, self._pending_axis_B)
+                    self.logger.info(f"Applied pending axis: A={self._pending_axis_A}, B={self._pending_axis_B}, result={result}")
+                except Exception as e:
+                    self.logger.error(f"Error applying pending axis: {e}")
+            self._pending_axis_A = None
+            self._pending_axis_B = None
+        
+        # Apply pending user ROI settings
+        if self._pending_user_roi is not None and self._pending_user_point is not None:
+            if hasattr(self._current_tracker, 'set_user_defined_roi_and_point'):
+                try:
+                    result = self._current_tracker.set_user_defined_roi_and_point(
+                        self._pending_user_roi, self._pending_user_point, None
+                    )
+                    self.logger.info(f"Applied pending user ROI: ROI={self._pending_user_roi}, Point={self._pending_user_point}, result={result}")
+                except Exception as e:
+                    self.logger.error(f"Error applying pending user ROI: {e}")
+            self._pending_user_roi = None
+            self._pending_user_point = None
+
+    def _extract_result_data(self, result, original_frame) -> Tuple[np.ndarray, Optional[List[Dict]]]:
+        """Extract processed frame and action log from tracker result."""
+        processed_frame = None
+        action_log = None
+
+        # Handle TrackerResult object
+        if hasattr(result, 'processed_frame') and hasattr(result, 'action_log'):
+            processed_frame, action_log = result.processed_frame, result.action_log
+            # Preserve full result for multi-axis extraction
+            if hasattr(result, 'multi_axis_data') or hasattr(result, 'secondary_action_log'):
+                self._last_tracker_result = result
+            else:
+                self._last_tracker_result = None
+        
+        # Handle tuple format
+        elif isinstance(result, tuple) and len(result) >= 2:
+            processed_frame, action_log = result[0], result[1]
+        
+        # Handle single frame return
+        elif isinstance(result, np.ndarray):
+            processed_frame, action_log = result, None
+        
+        # Fallback
+        else:
+            self.logger.warning(f"Unexpected tracker result format: {type(result)}")
+            processed_frame, action_log = original_frame, None
+        
+        # Send to device control if available and enabled
+        if action_log and len(action_log) > 0:
+            self.logger.debug(f"Attempting to send action to device control: {action_log[-1]}")
+            self._send_to_device_control(action_log[-1])  # Send latest action
+        else:
+            self.logger.debug(f"No action log to send to device control: action_log={action_log}")
+        
+        return processed_frame, action_log
+
+    def _is_not_relevant_chapter(self) -> bool:
+        """True when the current-frame chapter is Not Relevant (skip scripting).
+        Fails open (returns False) if anything can't be resolved."""
+        if self.app is None:
+            return False
+        try:
+            fs_proc = getattr(self.app, 'funscript_processor', None)
+            processor = getattr(self.app, 'processor', None)
+            if not (fs_proc and processor):
+                return False
+            chapter = fs_proc.get_chapter_at_frame(processor.current_frame_index)
+            if chapter is None:
+                return False
+            info = POSITION_INFO_MAPPING.get(chapter.position_short_name, {})
+            return info.get('category', 'Position') == "Not Relevant"
+        except Exception as e:
+            self.logger.warning(f"Could not check chapter type for scripting: {e}")
+            return False
+
+    def _add_actions_to_funscript(self, action_log: Optional[List[Dict]], skip_scripting: bool = False):
+        """Add action log entries to the funscript, skipping 'Not Relevant' category chapters."""
+        if skip_scripting or not action_log or not self.funscript:
+            return
+
+        try:
+            for action in action_log:
+                if isinstance(action, dict) and 'at' in action and 'pos' in action:
+                    timestamp_ms = action['at']
+                    position = action['pos']
+                    axis = action.get('axis', 'primary')
+                    if axis == 'secondary':
+                        self.funscript.add_action(timestamp_ms, primary_pos=None, secondary_pos=position)
+                    else:
+                        self.funscript.add_action(timestamp_ms, position)
+        except Exception as e:
+            self.logger.error(f"Error adding actions to funscript: {e}")
+
+    def _add_multi_axis_to_funscript(self, skip_scripting: bool = False):
+        """Route secondary_action_log and multi_axis_data from the last TrackerResult to the funscript."""
+        result = self._last_tracker_result
+        if skip_scripting or result is None or not self.funscript:
+            return
+
+        try:
+            # Route secondary_action_log -> secondary axis
+            secondary_log = getattr(result, 'secondary_action_log', None)
+            if secondary_log:
+                for action in secondary_log:
+                    if isinstance(action, dict) and 'at' in action and 'pos' in action:
+                        self.funscript.add_action(action['at'], primary_pos=None, secondary_pos=action['pos'])
+
+            # Route multi_axis_data -> additional axes
+            multi_axis = getattr(result, 'multi_axis_data', None)
+            if multi_axis:
+                for axis_name, actions in multi_axis.items():
+                    for action in actions:
+                        if isinstance(action, dict) and 'at' in action and 'pos' in action:
+                            self.funscript.add_action_to_axis(axis_name, action['at'], action['pos'])
+        except Exception as e:
+            self.logger.error(f"Error adding multi-axis data to funscript: {e}")
+
+    def _apply_rolling_autotune(self, current_time_ms: int):
+        """
+        Apply Ultimate Autotune to the last N seconds of funscript data.
+        This creates a rolling window of cleaned-up data for streaming scenarios.
+
+        The cleaned data should be ahead of the actual playback position by at least
+        the window size, ensuring smooth, optimized output reaches devices/clients.
+
+        Args:
+            current_time_ms: Current timestamp in milliseconds
+        """
+        if not self.funscript:
+            return
+
+        # Check which axes have data
+        has_primary = self.funscript.primary_actions and len(self.funscript.primary_actions) > 0
+        has_secondary = self.funscript.secondary_actions and len(self.funscript.secondary_actions) > 0
+
+        if not has_primary and not has_secondary:
+            return
+
+        # Calculate time window
+        start_time = current_time_ms - self.rolling_autotune_window_ms
+
+        try:
+            # Apply Ultimate Autotune to this window only
+            from funscript.plugins.ultimate_autotune_plugin import UltimateAutotunePlugin
+            autotune = UltimateAutotunePlugin()
+
+            axes_processed = []
+
+            # Acquire lock to prevent race conditions with timeline rendering
+            # This ensures the funscript isn't being modified while the GUI is reading it
+            if hasattr(self.funscript, '_lock'):
+                lock = self.funscript._lock
+            else:
+                # Create a lock if it doesn't exist (for backwards compatibility)
+                import threading
+                lock = threading.RLock()
+                self.funscript._lock = lock
+
+            with lock:
+                # Process primary axis if it has data
+                if has_primary:
+                    primary_actions = self.funscript.primary_actions
+                    primary_indices = [
+                        i for i, action in enumerate(primary_actions)
+                        if start_time <= action['at'] <= current_time_ms
+                    ]
+
+                    if len(primary_indices) >= 2:
+                        result = autotune.transform(
+                            self.funscript,
+                            axis='primary',
+                            selected_indices=primary_indices
+                        )
+                        if result:
+                            axes_processed.append(f"primary({len(primary_indices)} pts)")
+
+                # Process secondary axis if it has data
+                if has_secondary:
+                    secondary_actions = self.funscript.secondary_actions
+                    secondary_indices = [
+                        i for i, action in enumerate(secondary_actions)
+                        if start_time <= action['at'] <= current_time_ms
+                    ]
+
+                    if len(secondary_indices) >= 2:
+                        result = autotune.transform(
+                            self.funscript,
+                            axis='secondary',
+                            selected_indices=secondary_indices
+                        )
+                        if result:
+                            axes_processed.append(f"secondary({len(secondary_indices)} pts)")
+
+            if axes_processed:
+                self.logger.info(f"Rolling autotune applied to {', '.join(axes_processed)} "
+                               f"({start_time}ms - {current_time_ms}ms)")
+            else:
+                self.logger.debug(f"Not enough data for rolling autotune in window")
+
+        except Exception as e:
+            self.logger.error(f"Error applying rolling autotune: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _init_device_bridge(self):
+        """Initialize device control bridge if available."""
+        try:
+            # Check if device_control folder exists (supporter feature)
+            if self._is_device_control_available():
+                from device_control.bridges.live_tracker_bridge import create_live_tracker_bridge
+                
+                # Get device manager from app if available
+                device_manager = getattr(self.app, 'device_manager', None)
+                if device_manager:
+                    self.device_bridge = create_live_tracker_bridge(device_manager)
+                    self.logger.info("Device control bridge initialized for live tracking")
+                else:
+                    self.logger.debug("Device manager not available in app")
+        except ImportError:
+            # Device control not available (non-subscriber)
+            self.device_bridge = None
+            self.logger.debug("Device control not available - live device control disabled")
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize device control bridge: {e}")
+            self.device_bridge = None
+    
+    def _is_device_control_available(self) -> bool:
+        """Check if device control features are available."""
+        from pathlib import Path
+        return Path("device_control").exists()
+    
+    def set_live_device_control_enabled(self, enabled: bool):
+        """Enable/disable live device control (user toggle)."""
+        self.live_device_control_enabled = enabled
+        self.logger.info(f"Live device control {'enabled' if enabled else 'disabled'}")
+        
+        if enabled and self.device_bridge:
+            # Start device bridge (handle no event loop gracefully)
+            import asyncio
+            try:
+                # Check if there's an active event loop
+                loop = asyncio.get_running_loop()
+                asyncio.create_task(self.device_bridge.start())
+            except RuntimeError:
+                # No event loop available - manually activate bridge
+                self.device_bridge.is_active = True
+                # Also claim control source so can_send_commands('desktop') passes
+                self.device_bridge.device_manager.set_control_source(
+                    'desktop', 'live_tracker_bridge:manual_activation')
+                self.logger.debug("No event loop - manually activated device bridge and claimed control source")
+        elif self.device_bridge:
+            # Stop device bridge (handle no event loop gracefully)
+            import asyncio
+            try:
+                # Check if there's an active event loop
+                loop = asyncio.get_running_loop()
+                asyncio.create_task(self.device_bridge.stop())
+            except RuntimeError:
+                # No event loop available - manually deactivate bridge
+                self.device_bridge.is_active = False
+                # Release control source
+                self.device_bridge.device_manager.set_control_source(
+                    None, 'live_tracker_bridge:manual_deactivation')
+                self.logger.debug("No event loop - manually deactivated device bridge and released control source")
+
+    def _send_to_device_control(self, latest_action: Dict):
+        """Send latest tracking position to device control."""
+        # Check if device bridge needs to be initialized
+        if not self.device_bridge and hasattr(self.app, 'device_manager'):
+            self.logger.info("Device manager available but no bridge - re-initializing bridge")
+            self._init_device_bridge()
+            
+            # Also check if live tracking should be enabled from settings
+            if not self.live_device_control_enabled:
+                live_tracking_enabled = self.app.app_settings.get("device_control_live_tracking", False)
+                if live_tracking_enabled:
+                    self.set_live_device_control_enabled(True)
+                    self.logger.info("Auto-enabled live device control from settings")
+        
+        # Debug logging for device control flow
+        device_manager = getattr(self.app, 'device_manager', None)
+        device_connected = device_manager.is_connected() if device_manager else False
+        connected_devices = list(device_manager.connected_devices.keys()) if device_manager else []
+        
+        # Use debug level for routine checks to reduce verbosity during normal operation
+        self.logger.debug(f"Device control check: bridge={self.device_bridge is not None}, "
+                         f"enabled={self.live_device_control_enabled}, active={self.tracking_active}")
+        self.logger.debug(f"Device manager: exists={device_manager is not None}, "
+                         f"connected={device_connected}, devices={connected_devices}")
+        
+        if not (self.device_bridge and 
+                self.live_device_control_enabled and 
+                self.tracking_active):
+            # Log what's preventing device control (only warn once per session)
+            if not self.device_bridge and not hasattr(self, '_no_bridge_warned'):
+                self.logger.debug("Live tracking device control: No device bridge available")
+                self._no_bridge_warned = True
+            if not self.live_device_control_enabled and not hasattr(self, '_not_enabled_warned'):
+                self.logger.debug("Live tracking device control: Not enabled - check Control Panel -> Global Device Settings -> 'Enable Live Tracking Control'")
+                self._not_enabled_warned = True
+            return
+            
+        try:
+            if not isinstance(latest_action, dict):
+                return
+                
+            # Extract positions from action
+            primary_pos = latest_action.get('pos')
+            secondary_pos = latest_action.get('secondary_pos', 50.0)  # Default center
+            
+            if primary_pos is not None:
+                # Import TrackerResult here to avoid import issues for non-subscribers
+                try:
+                    from tracker.tracker_modules.core.base_tracker import TrackerResult
+                except ImportError:
+                    # Create a simple mock if TrackerResult not available
+                    class TrackerResult:
+                        def __init__(self, processed_frame, action_log, debug_info):
+                            self.processed_frame = processed_frame
+                            self.action_log = action_log
+                            self.debug_info = debug_info
+                
+                # Create a TrackerResult-like object for the bridge
+                mock_result = TrackerResult(
+                    processed_frame=None,  # Not needed for device control
+                    action_log=None,
+                    debug_info={
+                        'primary_position': primary_pos,
+                        'secondary_position': secondary_pos,
+                        'timestamp_ms': latest_action.get('at', 0)
+                    }
+                )
+                
+                # Send to device bridge
+                self.device_bridge.on_tracker_result(mock_result)
+                
+        except Exception as e:
+            self.logger.error(f"Error sending to device control: {e}")
+
+    def _update_visualization_state(self):
+        """Update visualization state from current tracker."""
+        if not self._current_tracker:
+            return
+
+        # Proxy live_overlay and debug_frame from inner tracker for ImGui rendering
+        self.live_overlay = getattr(self._current_tracker, 'live_overlay', {})
+        self.debug_frame = getattr(self._current_tracker, 'debug_frame', None)
+
+        # Update ROI for visualization overlay
+        if hasattr(self._current_tracker, 'roi'):
+            self.roi = getattr(self._current_tracker, 'roi', None)
+        
+        # Update FPS if available
+        if hasattr(self._current_tracker, 'current_fps'):
+            self.current_fps = getattr(self._current_tracker, 'current_fps', 0.0)
+            # Propagate VIDEO fps (not wall-clock processing fps) to funscript for snap_to_frame
+            if self.funscript and self.funscript.fps is None and self.app:
+                video_fps = getattr(getattr(self.app, 'processor', None), 'fps', 0)
+                if video_fps > 0:
+                    self.funscript.fps = video_fps
+        
+        # Update show_roi toggle and tracked point from current tracker
+        if hasattr(self._current_tracker, 'show_roi'):
+            self.show_roi = getattr(self._current_tracker, 'show_roi', True)
+        if hasattr(self._current_tracker, 'user_roi_tracked_point_relative'):
+            self.user_roi_tracked_point_relative = getattr(self._current_tracker, 'user_roi_tracked_point_relative', None)
+        if hasattr(self._current_tracker, 'user_roi_fixed'):
+            self.user_roi_fixed = getattr(self._current_tracker, 'user_roi_fixed', None)
+
+        # Update live tracker GUI attributes for motion mode overlay
+        if hasattr(self._current_tracker, 'enable_inversion_detection'):
+            self.enable_inversion_detection = getattr(self._current_tracker, 'enable_inversion_detection', False)
+        if hasattr(self._current_tracker, 'motion_mode'):
+            self.motion_mode = getattr(self._current_tracker, 'motion_mode', 'normal')
+        if hasattr(self._current_tracker, 'main_interaction_class'):
+            self.main_interaction_class = getattr(self._current_tracker, 'main_interaction_class', None)
+
+    def _provide_tracker_compatibility_attributes(self):
+        """Provide attributes that modular trackers might expect from the old ROITracker."""
+        if not self._current_tracker:
+            return
+            
+        # Copy manager properties to the tracker instance so it can access them
+        # IMPORTANT: Only set attributes that don't already exist to avoid overwriting tracker's own attributes
+        compatibility_attrs = {
+            'oscillation_history': self.oscillation_history,
+            'oscillation_area_fixed': self.oscillation_area_fixed,
+            'oscillation_cell_persistence': self.oscillation_cell_persistence,
+            '_gray_full_buffer': self._gray_full_buffer,
+            'prev_gray': self.prev_gray,
+            'prev_gray_oscillation': self.prev_gray_oscillation,
+            'grid_size': self.grid_size,
+            'oscillation_grid_size': self.oscillation_grid_size,
+            'oscillation_threshold': self.oscillation_threshold,
+            'user_roi_fixed': self.user_roi_fixed,
+            'user_roi_current_flow_vector': self.user_roi_current_flow_vector,
+            'user_roi_initial_point_relative': self.user_roi_initial_point_relative,
+            'user_roi_tracked_point_relative': self.user_roi_tracked_point_relative,
+            'roi': self.roi,
+            'sensitivity': self.sensitivity,
+            'confidence_threshold': self.confidence_threshold,
+            'show_all_boxes': self.show_all_boxes,
+            'show_flow': self.show_flow,
+            'show_stats': self.show_stats,
+            'funscript': self.funscript,
+            'initialized': self.initialized
+        }
+        
+        for attr_name, attr_value in compatibility_attrs.items():
+            # Only set if not already present in the tracker
+            if not hasattr(self._current_tracker, attr_name):
+                setattr(self._current_tracker, attr_name, attr_value)
+            # Special case: for dictionary attributes, only set if they're None or not initialized
+            elif attr_name in ['oscillation_history', 'oscillation_cell_persistence'] and hasattr(self._current_tracker, attr_name):
+                current_val = getattr(self._current_tracker, attr_name)
+                # Only override if the tracker's value is None or not a dict
+                if current_val is None or not isinstance(current_val, dict):
+                    setattr(self._current_tracker, attr_name, attr_value)
+
+
+# Factory function for creating manager instances
+def create_tracker_manager(app_logic_instance: Optional[Any], 
+                          tracker_model_path: str) -> TrackerManager:
+    """Factory function to create tracker manager instances."""
+    return TrackerManager(app_logic_instance, tracker_model_path)

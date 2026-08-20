@@ -1,0 +1,405 @@
+"""
+Base tracker interface and common types for modular tracker system.
+
+This module provides the foundation for the plugin-based tracker architecture,
+allowing community developers to easily create new tracking algorithms.
+"""
+
+# numpy/cv2 only appear in type hints; PEP 563 lets us skip importing them here.
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import Dict, Any, Optional, List, Tuple, TYPE_CHECKING
+from dataclasses import dataclass
+import logging
+
+if TYPE_CHECKING:
+    import numpy as np
+
+
+@dataclass
+class StageDefinition:
+    """Definition of a processing stage in a tracker."""
+    stage_number: int
+    name: str
+    description: str
+    produces_funscript: bool = False
+    requires_previous: bool = False
+    output_type: str = "analysis"  # "analysis", "funscript", "segmentation", "mixed"
+
+
+class TrackerMetadata:
+    """Metadata describing a tracker for UI display and discovery."""
+    
+    def __init__(self, 
+                 name: str,
+                 display_name: str, 
+                 description: str,
+                 category: str,
+                 version: str,
+                 author: str,
+                 tags: Optional[List[str]] = None,
+                 requires_roi: bool = False,
+                 supports_dual_axis: bool = True,
+                 primary_axis: str = "stroke",
+                 secondary_axis: str = "roll",
+                 additional_axes: Optional[List[str]] = None,
+                 stages: Optional[List[StageDefinition]] = None,
+                 properties: Optional[Dict[str, Any]] = None):
+        """
+        Initialize tracker metadata.
+
+        Args:
+            name: Internal identifier (must be unique)
+            display_name: Human-readable name for UI display
+            description: Short description of the tracker's purpose
+            category: Category ("live", "offline", "experimental", "community")
+            version: Semantic version (e.g., "1.0.0")
+            author: Author name or organization
+            tags: Optional list of tags for filtering/search
+            requires_roi: Whether tracker needs ROI selection
+            supports_dual_axis: Whether tracker supports dual-axis output
+            primary_axis: Semantic axis name for timeline 1 output (e.g. "stroke")
+            secondary_axis: Semantic axis name for timeline 2 output (e.g. "roll")
+            additional_axes: Extra axis names beyond primary/secondary (e.g. ["pitch", "twist", "sway"]).
+                             Trackers can declare arbitrary names — they don't have to be from FunscriptAxis.
+            stages: List of processing stages this tracker uses
+            properties: Dictionary of tracker-specific properties/capabilities
+        """
+        self.name = name
+        self.display_name = display_name
+        self.description = description
+        self.category = category
+        self.version = version
+        self.author = author
+        self.tags = tags or []
+        self.requires_roi = requires_roi
+        self.supports_dual_axis = supports_dual_axis
+        self.primary_axis = primary_axis
+        self.secondary_axis = secondary_axis
+        self.additional_axes = additional_axes or []
+        self.stages = stages or []
+        self.properties = properties or {}
+        
+        # Auto-generate properties from name for backward compatibility
+        if not self.properties and self.stages:
+            self._auto_generate_properties()
+    
+    def _auto_generate_properties(self):
+        """Auto-generate properties based on stages for backward compatibility."""
+        self.properties = {
+            "num_stages": len(self.stages),
+            "supports_batch": self.category in ["live", "offline"] and not self.requires_roi,
+            "supports_realtime": self.category == "live",
+            "requires_intervention": self.requires_roi
+        }
+        
+        # Check which stages produce funscripts
+        for stage in self.stages:
+            if stage.produces_funscript:
+                self.properties[f"produces_funscript_in_stage{stage.stage_number}"] = True
+                
+    def has_property(self, property_name: str) -> bool:
+        """Check if tracker has a specific property."""
+        return property_name in self.properties and self.properties[property_name]
+    
+    def get_property(self, property_name: str, default: Any = None) -> Any:
+        """Get a property value with optional default."""
+        return self.properties.get(property_name, default)
+    
+    def get_stage(self, stage_number: int) -> Optional[StageDefinition]:
+        """Get a specific stage definition by number."""
+        for stage in self.stages:
+            if stage.stage_number == stage_number:
+                return stage
+        return None
+
+
+class TrackerResult:
+    """Result returned by tracker processing with backward compatibility for tuple access."""
+    
+    def __init__(self,
+                 processed_frame: np.ndarray,
+                 action_log: Optional[List[Dict]] = None,
+                 debug_info: Optional[Dict] = None,
+                 status_message: Optional[str] = None,
+                 secondary_action_log: Optional[List[Dict]] = None,
+                 multi_axis_data: Optional[Dict[str, List[Dict]]] = None):
+        """
+        Initialize tracker result.
+
+        Args:
+            processed_frame: Frame with visual overlays applied
+            action_log: List of funscript actions generated this frame
+            debug_info: Optional debug information for display
+            status_message: Optional status message for UI
+            secondary_action_log: Actions for secondary axis (e.g. roll)
+            multi_axis_data: Dict mapping axis names to action lists
+                             (e.g. {"roll": [...], "pitch": [...], "twist": [...]})
+        """
+        self.processed_frame = processed_frame
+        self.action_log = action_log
+        self.debug_info = debug_info
+        self.status_message = status_message
+        self.secondary_action_log = secondary_action_log
+        self.multi_axis_data = multi_axis_data or {}
+    
+    def __getitem__(self, index: int):
+        """Support tuple-like access for backward compatibility with video processor."""
+        if index == 0:
+            return self.processed_frame
+        elif index == 1:
+            return self.action_log
+        else:
+            raise IndexError(f"TrackerResult index out of range: {index} (only 0 and 1 supported)")
+    
+    def __iter__(self):
+        """Support tuple-like unpacking for backward compatibility."""
+        yield self.processed_frame
+        yield self.action_log
+    
+    def __len__(self):
+        """Support len() for tuple-like behavior."""
+        return 2
+
+
+class BaseTracker(ABC):
+    """
+    Base class for all tracking algorithms.
+
+    Community developers should inherit from this class and implement all
+    abstract methods. The tracker will be automatically discovered and
+    made available in the UI.
+    """
+
+    # False = process_frame won't write to input. Lets VideoProcessor skip
+    # a 75MB memcpy per frame on 8K VR. Default True for safety.
+    mutates_input_frame: bool = True
+
+    def __init__(self):
+        self.logger = logging.getLogger(f"Tracker.{self.__class__.__name__}")
+        self.app = None
+        self.tracking_active = False
+        self._initialized = False
+        self.live_overlay = {}
+    
+    @property
+    @abstractmethod
+    def metadata(self) -> TrackerMetadata:
+        """
+        Return tracker metadata for UI display and discovery.
+        
+        This property must be implemented as a class property that returns
+        TrackerMetadata with all required information about this tracker.
+        
+        Returns:
+            TrackerMetadata: Metadata describing this tracker
+        """
+        pass
+    
+    @abstractmethod
+    def initialize(self, app_instance, **kwargs) -> bool:
+        """
+        Initialize the tracker with app instance and settings.
+        
+        This method is called once when the tracker is selected. Use it to:
+        - Store reference to app instance
+        - Initialize internal state
+        - Set up required resources
+        - Validate configuration
+        
+        Args:
+            app_instance: Main application instance with access to settings,
+                         funscript, video processor, etc.
+            **kwargs: Additional initialization parameters
+        
+        Returns:
+            bool: True if initialization successful, False otherwise
+        """
+        pass
+    
+    @abstractmethod  
+    def process_frame(self, frame: np.ndarray, frame_time_ms: int, 
+                     frame_index: Optional[int] = None) -> TrackerResult:
+        """
+        Process a single video frame and return tracking results.
+        
+        This is the core method that processes each frame of video and
+        generates funscript actions. The method should:
+        - Analyze the frame for motion/features
+        - Update internal tracking state
+        - Generate funscript actions if tracking is active
+        - Apply visual overlays to the frame
+        - Return results via TrackerResult
+        
+        Args:
+            frame: Video frame as numpy array (H, W, C) in BGR format
+            frame_time_ms: Timestamp of frame in milliseconds
+            frame_index: Optional frame number in sequence
+        
+        Returns:
+            TrackerResult: Processing results including modified frame and actions
+        """
+        pass
+    
+    @abstractmethod
+    def start_tracking(self) -> bool:
+        """
+        Start the tracking session.
+        
+        Called when user clicks "Start Live Tracking". Use this to:
+        - Initialize tracking state
+        - Reset internal buffers
+        - Start generating funscript actions
+        - Set tracking_active = True
+        
+        Returns:
+            bool: True if tracking started successfully, False otherwise
+        """
+        pass
+    
+    @abstractmethod
+    def stop_tracking(self) -> bool:
+        """
+        Stop the tracking session.
+        
+        Called when user clicks "Stop" or switches modes. Use this to:
+        - Stop generating funscript actions  
+        - Set tracking_active = False
+        - Preserve state for potential restart
+        
+        Returns:
+            bool: True if tracking stopped successfully, False otherwise
+        """
+        pass
+    
+    def reset(self, reason: Optional[str] = None, **kwargs):
+        """
+        Reset session-specific state for a new video or project.
+
+        Called when the user closes a project or loads a new video.
+        Subclasses should override to clear cached video-specific state
+        (e.g. VR detection, ROI, flow history) while keeping expensive
+        resources like loaded models intact.
+        """
+        self.tracking_active = False
+
+    def validate_settings(self, settings: Dict[str, Any]) -> bool:
+        """
+        Validate tracker-specific settings.
+
+        Override this method to validate custom settings before they are
+        applied to the tracker. This is called when settings change.
+
+        Args:
+            settings: Dictionary of setting name -> value pairs
+
+        Returns:
+            bool: True if settings are valid, False otherwise
+        """
+        return True
+    
+    def cleanup(self):
+        """
+        Clean up resources when tracker is being destroyed.
+        
+        Override this method to:
+        - Release allocated memory
+        - Close file handles
+        - Clean up OpenCV objects
+        - Stop background threads
+        """
+        pass
+    
+    def get_status_info(self) -> Dict[str, Any]:
+        """
+        Get current status information for UI display.
+        
+        Override this method to provide custom status information
+        that will be displayed in the tracker status panel.
+        
+        Returns:
+            Dict: Status information key-value pairs
+        """
+        return {
+            "tracker": self.metadata.display_name,
+            "active": self.tracking_active,
+            "initialized": self._initialized
+        }
+    
+    def set_roi(self, roi: Tuple[int, int, int, int]) -> bool:
+        """
+        Set region of interest for trackers that support it.
+        
+        Override this method if your tracker supports ROI selection.
+        
+        Args:
+            roi: Region of interest as (x, y, width, height)
+        
+        Returns:
+            bool: True if ROI was set successfully, False otherwise
+        """
+        return False
+    
+    def render_settings_ui(self) -> bool:
+        """
+        Override to render custom imgui settings for this tracker.
+        Called every frame when the tracker's settings panel is visible.
+        Full imgui API available — sliders, buttons, checkboxes, trees, etc.
+
+        Return True if you rendered content, False to fall through to
+        schema-based auto-render (get_settings_schema).
+        """
+        return False
+
+    @property
+    def uses_class_detection(self) -> bool:
+        """Whether this tracker uses YOLO class detection (enables class filtering UI)."""
+        return False
+
+    def render_debug_ui(self) -> bool:
+        """
+        Override to render debug info panel.
+        Return True if you rendered content.
+        """
+        return False
+
+    def on_setting_changed(self, key: str, value) -> None:
+        """Called when a schema-auto-rendered setting changes."""
+        pass
+
+    def get_settings_schema(self) -> Dict[str, Any]:
+        """
+        Get JSON schema describing tracker-specific settings.
+
+        Override this method to define custom settings that will be
+        automatically generated in the UI. Use JSON Schema format.
+
+        Returns:
+            Dict: JSON schema for tracker settings
+        """
+        return {}
+    
+    def _draw_tracking_indicator(self) -> None:
+        """Populate live_overlay with tracking indicator text."""
+        if self.tracking_active:
+            size = 640  # yolo_input_size reference
+            self.live_overlay.setdefault('texts', []).append({
+                'x': size - 120, 'y': size - 15,
+                'text': 'Tracking', 'color': (0, 1.0, 0, 1.0)
+            })
+
+
+class TrackerError(Exception):
+    """Exception raised by tracker operations."""
+    pass
+
+
+class TrackerInitializationError(TrackerError):
+    """Exception raised when tracker initialization fails."""
+    pass
+
+
+class TrackerProcessingError(TrackerError):
+    """Exception raised when frame processing fails."""
+    pass
