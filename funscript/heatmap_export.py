@@ -1,0 +1,91 @@
+"""Heatmap PNG export for funscript files.
+
+Generates horizontal heatmap images showing speed distribution over time,
+using the standard color gradient.
+"""
+import numpy as np
+from typing import List, Dict, Optional
+
+from application.utils.heatmap_utils import HeatmapColorMapper
+
+
+class HeatmapExporter:
+    """Generates and exports heatmap images from funscript actions."""
+
+    def __init__(self, max_speed: float = 400.0):
+        self._mapper = HeatmapColorMapper(max_speed=max_speed)
+
+    def generate_heatmap_image(
+        self,
+        actions: List[Dict],
+        duration_ms: float,
+        width: int = 2000,
+        height: int = 50,
+    ) -> np.ndarray:
+        """Generate a heatmap RGBA image as a numpy array.
+
+        Args:
+            actions: Funscript actions list [{'at': ms, 'pos': 0-100}, ...]
+            duration_ms: Total video/script duration in milliseconds
+            width: Output image width in pixels
+            height: Output image height in pixels
+
+        Returns:
+            numpy array of shape (height, width, 4) with uint8 RGBA values
+        """
+        if not actions or len(actions) < 2 or duration_ms <= 0:
+            # Return black image
+            return np.zeros((height, width, 4), dtype=np.uint8)
+
+        # Extract once and feed into compute_segment_speeds via the
+        # pre-built array param to skip the duplicate pass.
+        ats = np.fromiter((a['at'] for a in actions), dtype=np.float64,
+                          count=len(actions))
+        poss = np.fromiter((a['pos'] for a in actions), dtype=np.float64,
+                           count=len(actions))
+        speeds = HeatmapColorMapper.compute_segment_speeds(actions, ats_np=ats, poss_np=poss)
+        px_centers_ms = (np.arange(width, dtype=np.float64) + 0.5) * (duration_ms / width)
+        seg_idx = np.searchsorted(ats, px_centers_ms, side='right') - 1
+        np.clip(seg_idx, 0, len(speeds) - 1, out=seg_idx)
+        speed_profile = speeds[seg_idx].astype(np.float32)
+
+        # Convert speeds to colors
+        colors_rgba = self._mapper.speeds_to_colors_rgba(speed_profile)  # (width, 4) float
+
+        # Scale to uint8
+        colors_u8 = (colors_rgba * 255).astype(np.uint8)  # (width, 4)
+
+        # Tile vertically to create the full image
+        image = np.tile(colors_u8[np.newaxis, :, :], (height, 1, 1))
+
+        return image
+
+    def export_png(
+        self,
+        filepath: str,
+        actions: List[Dict],
+        duration_ms: float,
+        width: int = 2000,
+        height: int = 50,
+    ):
+        """Export heatmap as a PNG file.
+
+        Args:
+            filepath: Output file path (should end in .png)
+            actions: Funscript actions list
+            duration_ms: Total duration in ms
+            width: Image width
+            height: Image height
+        """
+        import cv2
+
+        image_rgba = self.generate_heatmap_image(actions, duration_ms, width, height)
+
+        # cv2 expects BGR(A), convert from RGBA
+        image_bgra = np.zeros_like(image_rgba)
+        image_bgra[:, :, 0] = image_rgba[:, :, 2]  # B
+        image_bgra[:, :, 1] = image_rgba[:, :, 1]  # G
+        image_bgra[:, :, 2] = image_rgba[:, :, 0]  # R
+        image_bgra[:, :, 3] = image_rgba[:, :, 3]  # A
+
+        cv2.imwrite(filepath, image_bgra)
