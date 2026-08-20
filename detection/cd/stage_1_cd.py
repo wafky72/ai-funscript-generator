@@ -1,0 +1,1156 @@
+import numpy as np
+import msgpack
+import time
+from multiprocessing import Process, Queue, Event, Value, freeze_support
+import platform
+import sys
+from threading import Thread as PyThread
+from queue import Empty, Full
+import os
+import logging
+from typing import Optional, Tuple, List
+import subprocess
+from queue import Queue as StdLibQueue
+
+from video import VideoProcessor
+from config import constants
+
+log_vid = logging.getLogger(__name__)
+
+def _validate_preprocessed_file_completeness(file_path: str, expected_frames: int, logger: logging.Logger, tolerance_frames: int = 5) -> bool:
+    """
+    Validates that a preprocessed msgpack file contains the expected number of frames within tolerance.
+
+    Args:
+        file_path: Path to the msgpack file
+        expected_frames: Expected number of frames
+        logger: Logger instance
+        tolerance_frames: Acceptable frame count difference
+
+    Returns:
+        True if file is complete and valid, False otherwise
+    """
+    try:
+        if not os.path.exists(file_path):
+            logger.warning(f"Preprocessed file does not exist: {file_path}")
+            return False
+
+        # Check file size - empty files are definitely invalid
+        if os.path.getsize(file_path) < 100:  # Minimum reasonable size
+            logger.warning(f"Preprocessed file is too small (likely empty): {file_path}")
+            return False
+
+        # Load and validate the msgpack content
+        with open(file_path, 'rb') as f:
+            data = msgpack.unpackb(f.read(), raw=False)
+
+        if not isinstance(data, list):
+            logger.warning(f"Preprocessed file has invalid format (not a list): {file_path}")
+            return False
+
+        actual_frames = len(data)
+        frame_diff = abs(actual_frames - expected_frames)
+
+        if frame_diff > tolerance_frames:
+            logger.warning(f"Preprocessed file frame count mismatch: expected {expected_frames}, got {actual_frames} (diff: {frame_diff})")
+            return False
+
+        # Check that frames have valid structure
+        valid_frames = 0
+        for frame_data in data:
+            if isinstance(frame_data, dict) and ('detections' in frame_data or 'poses' in frame_data):
+                valid_frames += 1
+
+        if valid_frames < (actual_frames * 0.8):  # At least 80% should be valid
+            logger.warning(f"Preprocessed file has too many invalid frames: {valid_frames}/{actual_frames}")
+            return False
+
+        logger.info(f"Preprocessed file validation passed: {actual_frames} frames (expected {expected_frames})")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error validating preprocessed file {file_path}: {e}")
+        return False
+
+def _is_already_preprocessed_video(video_path: str, logger: logging.Logger) -> bool:
+    """
+    Checks if a video file is already a preprocessed video to prevent double preprocessing.
+
+    Args:
+        video_path: Path to the video file
+        logger: Logger instance
+
+    Returns:
+        True if the video is already preprocessed, False otherwise
+    """
+    # Check by filename pattern
+    if video_path.endswith("_preprocessed.mp4"):
+        logger.warning(f"Video appears to be already preprocessed (by filename): {os.path.basename(video_path)}")
+        return True
+    
+    return False
+
+def _validate_preprocessed_video_completeness(video_path: str, expected_frames: int, expected_fps: float, logger: logging.Logger, tolerance_frames: int = 5) -> bool:
+    """
+    Validates that a preprocessed video has the expected duration and frame count.
+
+    Args:
+        video_path: Path to the video file
+        expected_frames: Expected number of frames
+        expected_fps: Expected FPS
+        logger: Logger instance
+        tolerance_frames: Acceptable frame count difference
+
+    Returns:
+        True if video is complete and valid, False otherwise
+    """
+    try:
+        if not os.path.exists(video_path):
+            logger.warning(f"Preprocessed video does not exist: {video_path}")
+            return False
+
+        # Check file size - very small files are likely corrupted
+        file_size = os.path.getsize(video_path)
+        if file_size < 500000:  # Less than 500kb is suspicious for any video
+            logger.warning(f"Preprocessed video is suspiciously small: {file_size} bytes")
+            return False
+
+        from video.frame_source.probe import probe
+        p = probe(video_path)
+        if p is None:
+            logger.warning(f"ffprobe failed for preprocessed video: {video_path}")
+            return False
+
+        if p.total_frames > 0:
+            frame_diff = abs(p.total_frames - expected_frames)
+            if frame_diff > tolerance_frames:
+                logger.warning(
+                    f"Preprocessed video frame count mismatch: "
+                    f"expected {expected_frames}, got {p.total_frames}")
+                return False
+        elif p.duration_sec > 0:
+            expected_duration = expected_frames / expected_fps
+            duration_diff = abs(p.duration_sec - expected_duration)
+            if duration_diff > (tolerance_frames / expected_fps):
+                logger.warning(
+                    f"Preprocessed video duration mismatch: "
+                    f"expected {expected_duration:.2f}s, got {p.duration_sec:.2f}s")
+                return False
+
+        logger.debug(f"Preprocessed video validation passed: {video_path}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error validating preprocessed video {video_path}: {e}")
+        return False
+
+def _cleanup_incomplete_file(file_path: str, logger: logging.Logger) -> None:
+    """
+    Safely removes an incomplete/corrupted preprocessed file.
+
+    Args:
+        file_path: Path to the file to remove
+        logger: Logger instance
+    """
+    try:
+        if os.path.exists(file_path):
+            # Create a backup with timestamp before deletion
+            backup_path = f"{file_path}.incomplete.{int(time.time())}"
+            os.rename(file_path, backup_path)
+            logger.info(f"Moved incomplete file to: {os.path.basename(backup_path)}")
+    except Exception as e:
+        logger.error(f"Failed to cleanup incomplete file {file_path}: {e}")
+        # Try direct deletion as fallback
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info(f"Deleted incomplete file: {os.path.basename(file_path)}")
+        except Exception as e2:
+            logger.error(f"Failed to delete incomplete file {file_path}: {e2}")
+
+def _determine_actual_hwaccel(selected_method: str, available_methods: List[str]) -> str:
+    """Determines the best HW accel method based on user selection, platform, and availability."""
+    system = platform.system().lower()
+
+    if selected_method == "auto":
+        if system == 'darwin' and 'videotoolbox' in available_methods:
+            return 'videotoolbox'
+        elif system in ['linux', 'windows']:
+            if 'cuda' in available_methods or 'nvdec' in available_methods: return 'cuda'
+            if 'qsv' in available_methods: return 'qsv'
+            if system == 'linux' and 'vaapi' in available_methods: return 'vaapi'
+        return 'none' # Fallback for auto
+    elif selected_method in available_methods:
+        return selected_method # Use user's valid selection
+    else:
+        return 'none' # Fallback if selection is invalid
+
+# --- Integrated FFmpegEncoder Class ---
+class FFmpegEncoder:
+    def __init__(self, output_file: str, width: int, height: int, fps: float, ffmpeg_path: str, hwaccel_method: str):
+        self.encoder_process = None
+        self.output_file = output_file
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.ffmpeg_path = ffmpeg_path
+        self.hwaccel_method = hwaccel_method
+        self.stderr_thread = None
+
+    def start(self):
+        encoder_cmd = [
+            self.ffmpeg_path, "-y", "-hide_banner",
+            "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{self.width}x{self.height}",
+            "-r", str(self.fps), "-i", "pipe:0",
+            *self._get_encoder_args(),
+            self.output_file, "-loglevel", "error"
+        ]
+        log_vid.info(f"Encoder command: {' '.join(encoder_cmd)}")
+        # Windows fix: prevent terminal windows from spawning
+        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        self.encoder_process = subprocess.Popen(encoder_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=creation_flags)
+        self.stderr_thread = PyThread(target=self._read_stderr, daemon=True)
+        self.stderr_thread.start()
+
+    def _read_stderr(self):
+        if self.encoder_process and self.encoder_process.stderr:
+            for line in iter(self.encoder_process.stderr.readline, b""):
+                decoded = line.decode("utf-8", errors="replace").strip()
+                if decoded:
+                    # FFmpeg writes info/stats to stderr; only real errors should be ERROR level
+                    low = decoded.lower()
+                    if any(kw in low for kw in ('error', 'fatal', 'failed', 'invalid', 'no such')):
+                        log_vid.error(f"FFmpeg: {decoded}")
+                    elif any(kw in low for kw in ('warning', 'deprecated')):
+                        log_vid.warning(f"FFmpeg: {decoded}")
+                    else:
+                        log_vid.debug(f"FFmpeg: {decoded}")
+
+    def encode_frame(self, frame_bytes):
+        if self.encoder_process and self.encoder_process.stdin:
+            try:
+                self.encoder_process.stdin.write(frame_bytes)
+            except (BrokenPipeError, IOError):
+                log_vid.error("Encoder pipe broke. Stopping encoding for this frame.")
+                self.stop()
+
+    def stop(self):
+        if not self.encoder_process: return
+        log_vid.info("Stopping encoder process...")
+        if self.encoder_process.stdin:
+            try:
+                self.encoder_process.stdin.close()
+            except (BrokenPipeError, IOError):
+                pass
+        try:
+            self.encoder_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            log_vid.warning("FFmpeg did not terminate gracefully. Killing.")
+            self.encoder_process.kill()
+        if self.stderr_thread: self.stderr_thread.join(timeout=1.0)
+        self.encoder_process = None
+        log_vid.info("Encoder process stopped.")
+
+    def _detect_encoding_devices(self) -> None:
+        """
+        Detects and logs all available hardware encoding devices with their device IDs.
+        This function tests each encoder type and reports availability.
+        """
+        log_vid.info("=== ENCODING DEVICE DETECTION ===")
+        
+        # Define encoder types to test
+        encoder_configs = [
+            ("hevc_videotoolbox", "VideoToolbox (Apple)"),
+            ("hevc_nvenc", "NVENC (NVIDIA)"),
+            ("hevc_amf", "AMF (AMD)"),
+            ("hevc_qsv", "QSV (Intel)"),
+            ("hevc_vaapi", "VAAPI (Linux)"),
+        ]
+        
+        all_devices = []
+        device_id = 0
+        
+        for encoder_codec, encoder_name in encoder_configs:
+            try:
+                subprocess.check_output([
+                    self.ffmpeg_path, "-hide_banner", "-f", "lavfi", "-i", "testsrc",
+                    "-frames:v", "1",
+                    "-c:v", encoder_codec, "-f", "null", "-"
+                ], stderr=subprocess.PIPE, text=True, timeout=5)
+                # If we get here, encoder is available
+                all_devices.append(f"Device {device_id}: {encoder_name}")
+                device_id += 1
+            except subprocess.CalledProcessError as e:
+                if encoder_codec in e.stderr:
+                    # Encoder exists but failed - might be device-specific
+                    all_devices.append(f"Device {device_id}: {encoder_name} - failed")
+                    device_id += 1
+            except Exception:
+                pass
+
+        if all_devices:
+            log_vid.info("Detected encoding devices:")
+            for device in all_devices:
+                log_vid.info(f"  {device}")
+        else:
+            log_vid.info("No hardware encoding devices detected")
+            
+        log_vid.info("=== END ENCODING DEVICE DETECTION ===")
+
+    def _get_encoder_args(self) -> List[str]:
+        """
+        Chooses the best available hardware encoder with a more robust priority.
+        Falls back to software libx265 if none is available.
+        Respects the user's hardware acceleration setting.
+        """
+
+        self._detect_encoding_devices()
+
+        # Note: hwaccel_method controls DECODING, not encoding.
+        # Always try hardware encoding regardless of decode setting.
+        try:
+            output = subprocess.check_output([self.ffmpeg_path, "-hide_banner", "-encoders"], text=True)
+        except Exception as e:
+            log_vid.warning(f"Failed to query FFmpeg encoders: {e}")
+            output = ""
+
+        # macOS is a special case and usually works well.
+        if "hevc_videotoolbox" in output:
+            log_vid.info("Using H.265 Apple VideoToolbox for hardware encoding.")
+            return ["-c:v", "hevc_videotoolbox", "-q:v", "20", "-pix_fmt", "yuv420p", "-b:v", "0"]
+
+        if "hevc_nvenc" in output:
+            log_vid.info("Using H.265 NVENC for hardware encoding.")
+            return ["-c:v", "hevc_nvenc", "-preset", "fast", "-qp", "26", "-pix_fmt", "yuv420p"]
+
+        elif "hevc_amf" in output:
+            log_vid.info("Using H.265 AMD AMF for hardware encoding.")
+            return ["-c:v", "hevc_amf", "-quality", "quality", "-qp_i", "26", "-qp_p", "26", "-pix_fmt", "yuv420p"]
+
+        elif "hevc_qsv" in output:
+            log_vid.info("Using H.265 Intel QSV for hardware encoding.")
+            return ["-c:v", "hevc_qsv", "-preset", "fast", "-global_quality", "26", "-pix_fmt", "yuv420p"]
+
+        elif "hevc_vaapi" in output: # Primarily for Linux
+            log_vid.info("Using H.265 VAAPI for hardware encoding.")
+            return ["-c:v", "hevc_vaapi", "-qp", "26", "-pix_fmt", "yuv420p"]
+        
+        # Fallback to software encoder if no hardware options are found
+        log_vid.warning("No supported hardware encoder found in FFmpeg build. Falling back to software libx265.")
+        return ["-c:v", "libx265", "-preset", "ultrafast", "-crf", "26", "-pix_fmt", "yuv420p"]
+
+class Stage1QueueMonitor:
+    def __init__(self):
+        self.frame_queue_puts = Value('i', 0)
+        self.frame_queue_gets = Value('i', 0)
+        self.result_queue_puts = Value('i', 0)
+        self.result_queue_gets = Value('i', 0)
+
+    def frame_queue_put(self, queue, item, block=True, timeout=None):
+        with self.frame_queue_puts.get_lock():
+            self.frame_queue_puts.value += 1
+            queue.put(item, block=block, timeout=timeout)
+
+    def frame_queue_get(self, queue, block=True, timeout=None):
+        with self.frame_queue_gets.get_lock():
+            item = queue.get(block=block, timeout=timeout)
+            self.frame_queue_gets.value += 1
+            return item
+
+    def result_queue_put(self, queue, item):
+        with self.result_queue_puts.get_lock():
+            self.result_queue_puts.value += 1
+            queue.put(item)
+
+    def result_queue_get(self, queue, block=True, timeout=None):
+        with self.result_queue_gets.get_lock():
+            item = queue.get(block=block, timeout=timeout)
+            self.result_queue_gets.value += 1
+            return item
+
+    def get_frame_queue_size(self, queue: Queue):
+        """Returns the approximate size of the queue."""
+        try:
+            return queue.qsize()
+        except NotImplementedError:  # Some platforms might not implement qsize()
+            # Fallback to the original, less accurate method if qsize() is not available
+            with self.frame_queue_puts.get_lock(), self.frame_queue_gets.get_lock():
+                return self.frame_queue_puts.value - self.frame_queue_gets.value
+
+
+    def get_result_queue_size(self):
+        with self.result_queue_puts.get_lock(), self.result_queue_gets.get_lock():
+            return self.result_queue_puts.value - self.result_queue_gets.value
+
+
+def video_processor_producer_proc(
+        producer_idx: int,
+        video_path_producer: str,
+        yolo_input_size_producer: int,
+        video_type_setting_producer: str,
+        vr_input_format_setting_producer: str,
+        vr_fov_setting_producer: int,
+        vr_pitch_setting_producer: int,
+        start_frame_abs_num: int,
+        num_frames_in_segment: int,
+        frame_queue: Queue,
+        queue_monitor_local: Stage1QueueMonitor,
+        stop_event_local: Event,
+        hwaccel_method_producer: Optional[str],
+        hwaccel_avail_list_producer: Optional[List[str]],
+        logger_config_for_vp_in_producer: Optional[dict] = None,
+        is_encoding_preprocessed_video: bool = False,
+        output_path_for_encoding: Optional[str] = None
+):
+    frames_put_to_queue_this_producer = 0
+    vp_instance = None
+    producer_logger = None
+    encoder = None
+
+    try:
+        # Create a proxy object for the VideoProcessor instance
+        class VPAppProxy:
+            pass
+
+        vp_app_proxy = VPAppProxy()
+        vp_app_proxy.hardware_acceleration_method = hwaccel_method_producer
+        vp_app_proxy.available_ffmpeg_hwaccels = hwaccel_avail_list_producer if hwaccel_avail_list_producer is not None else []
+        # Force v360 unwarp method for offline tracking to avoid low FPS with GPU unwarp (metal/opengl)
+        vp_app_proxy.app_settings = {'vr_unwarp_method': 'v360'}
+
+        # Instantiate the VideoProcessor using the proxy object.
+        vp_instance = VideoProcessor(
+            app_instance=vp_app_proxy,
+            tracker=None,
+            yolo_input_size=yolo_input_size_producer,
+            video_type=video_type_setting_producer,
+            vr_input_format=vr_input_format_setting_producer,
+            vr_fov=vr_fov_setting_producer,
+            vr_pitch=vr_pitch_setting_producer,
+            fallback_logger_config=logger_config_for_vp_in_producer
+        )
+        producer_logger = vp_instance.logger
+        if not producer_logger:
+            producer_logger = logging.getLogger(f"S1_VP_Producer_{producer_idx}_{os.getpid()}_Fallback")
+            if not producer_logger.hasHandlers():
+                handler = logging.StreamHandler()
+                formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(process)d - %(message)s')
+                handler.setFormatter(formatter)
+                producer_logger.addHandler(handler)
+                producer_logger.setLevel(logging.INFO)
+                producer_logger.warning("Used fallback logger for VP Producer.")
+
+        if not vp_instance.open_video(video_path_producer):
+            producer_logger.critical(
+                f"[S1 VP Producer-{producer_idx}] VideoProcessor could not open video '{video_path_producer}'.")
+            return
+
+        if is_encoding_preprocessed_video and output_path_for_encoding:
+            width = vp_instance.yolo_input_size
+            height = vp_instance.yolo_input_size
+            fps = vp_instance.video_info.get('fps', 30.0)
+            ffmpeg_path = os.environ.get("FFMPEG_PATH", "ffmpeg")
+
+            encoder = FFmpegEncoder(
+                output_file=output_path_for_encoding,
+                width=width,
+                height=height,
+                fps=fps,
+                ffmpeg_path=ffmpeg_path,
+                hwaccel_method=hwaccel_method_producer
+            )
+            producer_logger.info(f"Starting FFmpeg encoder for preprocessed video.")
+            encoder.start()
+
+        producer_logger.info(
+            f"[S1 VP Producer-{producer_idx}] Streaming segment: Video='{os.path.basename(vp_instance.video_path)}', StartFrameAbs={start_frame_abs_num}, NumFrames={num_frames_in_segment}, YOLOSize={vp_instance.yolo_input_size}")
+
+        for frame_id, frame, producer_timing in vp_instance.stream_frames_for_segment(start_frame_abs_num, num_frames_in_segment, stop_event=stop_event_local):
+            if stop_event_local.is_set():
+                producer_logger.info(
+                    f"[S1 VP Producer-{producer_idx}] Stop event detected. Processed {frames_put_to_queue_this_producer} frames.")
+                break
+
+            if encoder:
+                # numpy ndarrays satisfy the buffer protocol; stdin.write
+                # handles them directly without an intermediate bytes copy.
+                encoder.encode_frame(frame)
+
+            try:
+                # Source yields a fresh immutable-bytes-backed array; mp.Queue pickles it for transport.
+                queue_monitor_local.frame_queue_put(frame_queue, (frame_id, frame, producer_timing), block=True, timeout=0.5)
+            except Full:
+                # If the queue is full, check the stop event and continue the loop to check again.
+                if stop_event_local.is_set():
+                    producer_logger.info(f"[S1 VP Producer-{producer_idx}] Stop event detected while frame queue was full. Frame {frame_id} not added.")
+                    break
+                continue # Go to the next iteration of the main for loop to re-check stop event
+
+            if stop_event_local.is_set(): # Check if stop was set during the put_success loop
+                producer_logger.info(
+                    f"[S1 VP Producer-{producer_idx}] Stop event detected after attempting to queue frame {frame_id}. Loop terminating.")
+                break
+            frames_put_to_queue_this_producer += 1
+
+        if not stop_event_local.is_set() and frames_put_to_queue_this_producer < num_frames_in_segment:
+            producer_logger.warning(
+                f"[S1 VP Producer-{producer_idx}] Streamed {frames_put_to_queue_this_producer} frames, but expected {num_frames_in_segment}. Video might be shorter or stream ended early.")
+
+        producer_logger.info(
+            f"[S1 VP Producer-{producer_idx}] Segment streaming loop ended. Put {frames_put_to_queue_this_producer} frames to queue (Target: {num_frames_in_segment}). Stop event: {stop_event_local.is_set()}")
+
+    except Exception as e:
+        # Use producer_logger if available, otherwise print as a last resort
+        effective_logger = producer_logger if producer_logger else logging.getLogger(f"S1_VP_Producer_{producer_idx}_{os.getpid()}_ExceptionFallback")
+        if not effective_logger.hasHandlers() and not producer_logger : # Configure fallback if it's the exception fallback
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(process)d - %(message)s')
+            handler.setFormatter(formatter)
+            effective_logger.addHandler(handler)
+            effective_logger.setLevel(logging.INFO)
+        effective_logger.critical(f"[S1 VP Producer-{producer_idx}] Error in producer {producer_idx}: {e}", exc_info=True)
+        if not stop_event_local.is_set() : stop_event_local.set() # Signal main process about the error
+    finally:
+        if encoder:
+            producer_logger.info(f"[S1 VP Producer-{producer_idx}] Stopping video encoder...")
+            encoder.stop()
+
+        effective_logger_final = producer_logger if producer_logger else logging.getLogger(f"S1_VP_Producer_{producer_idx}_{os.getpid()}_FinallyFallback")
+        if not effective_logger_final.hasHandlers() and not producer_logger: # Configure fallback if it's the finally fallback
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(process)d - %(message)s')
+            handler.setFormatter(formatter)
+            effective_logger_final.addHandler(handler)
+            effective_logger_final.setLevel(logging.INFO)
+
+        # VideoProcessor teardown: close the frame source.
+        if vp_instance is not None:
+            try:
+                vp_instance.reset(close_video=True)
+            except Exception as e_vp_cleanup:
+                effective_logger_final.debug(
+                    f"[S1 VP Producer-{producer_idx}] vp reset: {e_vp_cleanup}")
+
+        frames_count_final = frames_put_to_queue_this_producer if 'frames_put_to_queue_this_producer' in locals() else 'unknown'
+        effective_logger_final.info(
+            f"[S1 VP Producer-{producer_idx}] Fully Exited. Final count of frames put to queue: {frames_count_final}. Stop event: {stop_event_local.is_set()}")
+
+def consumer_proc(frame_queue, result_queue, consumer_idx, yolo_det_model_path, yolo_pose_model_path,
+                  confidence_threshold, yolo_input_size_consumer, queue_monitor_local, stop_event_local,
+                  logger_config_for_consumer: Optional[dict] = None, video_fps: float = 30.0,
+                  shared_models: Optional[Tuple] = None):
+    # --- Logger setup ---
+    consumer_logger = logging.getLogger(f"S1_Consumer_{consumer_idx}_{os.getpid()}")
+
+    det_model, pose_model = None, None
+    owns_models = shared_models is None
+    try:
+        from tracker.tracker_modules.helpers.yolo_detection_helper import (
+            run_detection, run_pose, detection_to_dict, pose_to_dict,
+        )
+        if shared_models is not None:
+            det_model, pose_model = shared_models
+            pose_device = constants.DEVICE
+            consumer_logger.info(
+                f"[S1 Consumer-{consumer_idx}] Using shared model on '{constants.DEVICE}'.")
+        else:
+            try:
+                import torchvision
+                consumer_logger.debug(f"[S1 Consumer-{consumer_idx}] Pre-imported torchvision v{torchvision.__version__}")
+            except Exception as e:
+                consumer_logger.warning(f"[S1 Consumer-{consumer_idx}] Failed to pre-import torchvision: {e}")
+            from tracker.tracker_modules.helpers.yolo_detection_helper import load_model
+            consumer_logger.info(f"[S1 Consumer-{consumer_idx}] Loading models...")
+            det_model = load_model(
+                yolo_det_model_path, task='detect',
+                warmup_device=constants.DEVICE, warmup_imgsz=yolo_input_size_consumer,
+            )
+            pose_device = constants.DEVICE
+            pose_model = load_model(
+                yolo_pose_model_path, task='pose',
+                warmup_device=pose_device, warmup_imgsz=yolo_input_size_consumer,
+            )
+            consumer_logger.info(
+                f"[S1 Consumer-{consumer_idx}] Models loaded on '{constants.DEVICE}'.")
+
+        consecutive_errors = 0
+        MAX_CONSECUTIVE_ERRORS = 10
+
+        while not stop_event_local.is_set():
+            try:
+                item = queue_monitor_local.frame_queue_get(frame_queue, block=True, timeout=0.5)
+                if item is None:
+                    consumer_logger.info(f"[S1 Consumer-{consumer_idx}] Received sentinel. Exiting loop.")
+                    break
+                frame_id, frame = item[0], item[1]
+                producer_timing = item[2] if len(item) > 2 else {}
+
+                # --- Step 1: Perform Detection (on every frame) ---
+                t_det_start = time.time()
+                det_objs = run_detection(det_model, frame, conf=confidence_threshold,
+                                         imgsz=yolo_input_size_consumer, device=constants.DEVICE)
+                detections = [detection_to_dict(d) for d in det_objs]
+                yolo_det_ms = (time.time() - t_det_start) * 1000.0
+
+                # --- Step 2: Conditionally perform Pose Estimation ---
+                # Run roughly once per second; safe for low FPS values
+                poses = []  # Default to empty
+                yolo_pose_ms = 0.0
+                if frame_id % max(1, int(round(video_fps))) == 0:
+                    t_pose_start = time.time()
+                    pose_objs = run_pose(pose_model, frame, conf=confidence_threshold,
+                                         imgsz=yolo_input_size_consumer, device=pose_device)
+                    poses = [pose_to_dict(p) for p in pose_objs]
+                    yolo_pose_ms = (time.time() - t_pose_start) * 1000.0
+
+                # --- Step 3: Package results ---
+                # The 'poses' list will either have data or be empty.
+                result_payload = {
+                    "detections": detections,
+                    "poses": poses,
+                    "timing": {
+                        'decode_ms': producer_timing.get('decode_ms', 0.0),
+                        'unwarp_ms': producer_timing.get('unwarp_ms', 0.0),
+                        'yolo_det_ms': yolo_det_ms,
+                        'yolo_pose_ms': yolo_pose_ms,
+                    }
+                }
+                queue_monitor_local.result_queue_put(result_queue, (frame_id, result_payload))
+                consecutive_errors = 0  # Reset on success
+
+            except Empty:
+                continue
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    consumer_logger.critical(
+                        f"[S1 Consumer-{consumer_idx}] GPU out of memory. "
+                        "Reduce consumer count in Settings > Processing. Stopping.")
+                    stop_event_local.set()
+                    break
+                consecutive_errors += 1
+                consumer_logger.error(f"[S1 Consumer-{consumer_idx}] Error processing frame ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}", exc_info=True)
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    consumer_logger.critical(f"[S1 Consumer-{consumer_idx}] {MAX_CONSECUTIVE_ERRORS} consecutive errors, stopping pipeline.")
+                    stop_event_local.set()
+                    break
+            except Exception as e:
+                consecutive_errors += 1
+                consumer_logger.error(f"[S1 Consumer-{consumer_idx}] Error processing frame ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}", exc_info=True)
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    consumer_logger.critical(f"[S1 Consumer-{consumer_idx}] {MAX_CONSECUTIVE_ERRORS} consecutive errors, stopping pipeline.")
+                    stop_event_local.set()
+                    break
+
+    except Exception as e:
+        consumer_logger.critical(f"[S1 Consumer-{consumer_idx}] Critical setup error: {e}", exc_info=True)
+        stop_event_local.set()
+    finally:
+        if owns_models:
+            del det_model, pose_model
+        consumer_logger.info(f"[S1 Consumer-{consumer_idx}] Exiting.")
+
+
+def logger_proc(frame_processing_queue, result_queue, output_file_local, expected_frames,
+                progress_callback_local, queue_monitor_local, stop_event_local,
+                s1_start_time_param, parent_logger: logging.Logger,
+                gui_event_queue_arg: Optional[StdLibQueue] = None,
+                max_fps_container: Optional[list] = None,
+                start_frame_offset: int = 0):
+    results_dict = {}
+    written_count = 0
+    last_progress_update_time = time.time()
+    first_result_received_time = None
+    # --- Variables for instant FPS ---
+    last_instant_fps_update_time = time.time()
+    frames_since_last_instant_update = 0
+    instant_fps = 0.0
+    max_instant_fps = 0.0
+    # --- Per-stage timing averages (1-second rolling window) ---
+    timing_accum = {'decode_ms': 0.0, 'unwarp_ms': 0.0, 'yolo_det_ms': 0.0, 'yolo_pose_ms': 0.0}
+    timing_accum_count = 0
+    timing_avg = {'decode_ms': 0.0, 'unwarp_ms': 0.0, 'yolo_det_ms': 0.0, 'yolo_pose_ms': 0.0}
+    parent_logger.info(f"[S1 Logger] Expecting {expected_frames} frames. Writing to {output_file_local}")
+
+    if progress_callback_local:
+        # New signature: current, total, message, time_elapsed, avg_fps, instant_fps, eta_seconds
+        progress_callback_local(0, expected_frames, "Logger starting...", 0.0, 0.0, 0.0, -1)
+
+    while (written_count < expected_frames if expected_frames > 0 else True) and not stop_event_local.is_set():
+        try:
+            item = queue_monitor_local.result_queue_get(result_queue, block=True, timeout=0.5)
+
+            # Check for the sentinel value (None) to signal the end of results.
+            if item is None or item[0] is None:
+                parent_logger.info("[S1 Logger] Received end-of-stream sentinel. Finalizing results.")
+                break
+
+            # Simple get from the single result queue
+            frame_id, payload = item
+            if frame_id not in results_dict:
+                results_dict[frame_id] = payload
+                written_count += 1
+                frames_since_last_instant_update += 1
+                # Accumulate per-stage timing
+                frame_timing = payload.get("timing") if isinstance(payload, dict) else None
+                if frame_timing:
+                    for k in timing_accum:
+                        timing_accum[k] += frame_timing.get(k, 0.0)
+                    timing_accum_count += 1
+                if max_fps_container is not None:
+                    max_fps_container[1] = time.time()  # Update last progress time
+                if first_result_received_time is None:
+                    first_result_received_time = time.time()
+                    last_instant_fps_update_time = first_result_received_time
+
+            current_time = time.time()
+
+            # --- Instant FPS calculation every 1 second ---
+            time_since_last_instant_update = current_time - last_instant_fps_update_time
+            if time_since_last_instant_update >= 1.0:
+                instant_fps = frames_since_last_instant_update / time_since_last_instant_update
+                max_instant_fps = max(max_instant_fps, instant_fps)
+                frames_since_last_instant_update = 0
+                last_instant_fps_update_time = current_time
+                # Update per-stage timing averages
+                if timing_accum_count > 0:
+                    for k in timing_avg:
+                        timing_avg[k] = timing_accum[k] / timing_accum_count
+                    timing_accum = {k: 0.0 for k in timing_accum}
+                    timing_accum_count = 0
+
+            if progress_callback_local and (
+                    current_time - last_progress_update_time > 0.2 or written_count == expected_frames):
+                # Send queue updates to GUI
+                if gui_event_queue_arg:
+                    try:
+                        frame_q_size = queue_monitor_local.get_frame_queue_size(frame_processing_queue)
+                        gui_event_queue_arg.put(("stage1_queue_update",
+                                                 {"frame_q_size": frame_q_size,
+                                                  "result_q_size": queue_monitor_local.get_result_queue_size(),
+                                                  "pose_q_size": 0}, None))
+
+                    except Exception:
+                        pass
+
+                # --- Calculate and send main progress ---
+                time_elapsed = 0.0
+                avg_fps = 0.0
+                if first_result_received_time is not None:
+                    time_elapsed = current_time - first_result_received_time
+                    if time_elapsed > 0:
+                        avg_fps = written_count / time_elapsed
+
+                eta = (expected_frames - written_count) / avg_fps if avg_fps > 0 else 0
+                progress_callback_local(written_count, expected_frames, "Detecting objects & poses...", time_elapsed, avg_fps, instant_fps, eta, timing=timing_avg)
+                last_progress_update_time = current_time
+        except Empty:
+            continue
+        except Exception as e:
+            parent_logger.error(f"[S1 Logger] Error processing result: {e}", exc_info=True)
+
+    parent_logger.info(f"[S1 Logger] Result gathering loop ended. Written count: {written_count}.")
+
+    if stop_event_local.is_set():
+        if written_count > 0:
+            parent_logger.warning(f"[S1 Logger] Abort/stall detected. Saving partial results ({written_count} frames) to: {output_file_local}")
+            # Fall through to save logic instead of returning -- partial data is better than no data
+        else:
+            parent_logger.warning(f"[S1 Logger] Abort signal received with 0 results. Skipping save.")
+            return
+
+    # Save the results — use start_frame_offset for correct frame ID lookup
+    # When frame_range_arg is used, frame IDs are absolute (e.g. 30000-33596)
+    # but we store them sequentially in the msgpack (indices 0..N-1)
+    frame_id_range = range(start_frame_offset, start_frame_offset + expected_frames)
+
+    # --- POSE MEMORIZATION LOGIC ---
+    parent_logger.info("[S1 Logger] Assembling final results and filling pose gaps...")
+    ordered_results = [results_dict.get(i) for i in frame_id_range]
+
+    last_known_poses = []
+    for i in range(expected_frames):
+        # The result for the current frame might be None if it was missed
+        frame_result = ordered_results[i]
+        if frame_result is None:
+            # If a frame is missing entirely, create a default structure
+            ordered_results[i] = {"detections": [], "poses": last_known_poses}
+            continue
+
+        # Check if this frame has newly calculated poses
+        if frame_result.get("poses"):
+            # If yes, update our cache
+            last_known_poses = frame_result["poses"]
+        else:
+            # If no, fill it with the last known poses from the cache
+            frame_result["poses"] = last_known_poses
+
+    # Strip timing data before saving — it's only needed for live UI
+    for r in ordered_results:
+        if isinstance(r, dict):
+            r.pop("timing", None)
+
+    try:
+        with open(output_file_local, 'wb') as f:
+            f.write(msgpack.packb(ordered_results, use_bin_type=True))
+        parent_logger.info(f"Save complete. Wrote {len(ordered_results)} entries to {output_file_local}.")
+
+        # Validate the saved file
+        if not _validate_preprocessed_file_completeness(output_file_local, expected_frames, parent_logger):
+            parent_logger.warning(f"Preprocessed file validation failed. File may be incomplete: {output_file_local}")
+    except Exception as e:
+        parent_logger.error(f"Error writing output file '{output_file_local}': {e}", exc_info=True)
+
+    if max_fps_container is not None:
+        max_fps_container[0] = max_instant_fps
+    parent_logger.info(f"[S1 Logger] Final Max FPS recorded: {max_instant_fps:.2f}")
+
+
+def perform_yolo_analysis(
+        video_path_arg: str,
+        yolo_model_path_arg: str,
+        yolo_pose_model_path_arg: str,
+        confidence_threshold: float,
+        progress_callback: callable,
+        stop_event_external: Event,
+        num_producers_arg: int,
+        num_consumers_arg: int,
+        video_type_arg: str = 'auto',
+        vr_input_format_arg: str = 'he',
+        vr_fov_arg: int = 190,
+        vr_pitch_arg: int = 0,
+        yolo_input_size_arg: int = 640,
+        app_logger_config_arg: Optional[dict] = None,
+        gui_event_queue_arg: Optional[StdLibQueue] = None,
+        hwaccel_method_arg: Optional[str] = 'auto',
+        hwaccel_avail_list_arg: Optional[List[str]] = None,
+        frame_range_arg: Optional[Tuple[Optional[int], Optional[int]]] = None,
+        output_filename_override: Optional[str] = None,
+        save_preprocessed_video_arg: bool = True,
+        preprocessed_video_path_arg: Optional[str] = None,
+        is_autotune_run_arg: bool = False
+):
+    process_logger = None
+    fallback_config_for_subprocesses = None
+
+    if app_logger_config_arg and app_logger_config_arg.get('main_logger'):
+        process_logger = app_logger_config_arg['main_logger']
+    else:
+        process_logger = logging.getLogger("S1_Lib_Orchestrator")
+        if not process_logger.hasHandlers():
+            handler = logging.StreamHandler()
+            log_level_orch = logging.INFO
+            if app_logger_config_arg and app_logger_config_arg.get('log_level') is not None:
+                log_level_orch = app_logger_config_arg['log_level']
+            if app_logger_config_arg and app_logger_config_arg.get('log_file'):
+                try:
+                    handler = logging.FileHandler(app_logger_config_arg['log_file'])
+                except Exception:
+                    pass
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(threadName)s - %(message)s')
+            handler.setFormatter(formatter)
+            process_logger.addHandler(handler)
+            process_logger.setLevel(log_level_orch)
+
+    # Now, validate the output path.
+    if output_filename_override:
+        result_file_local = output_filename_override
+        # Ensure the directory exists.
+        output_dir = os.path.dirname(result_file_local)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+    else:
+        # If no output path is provided, abort the process.
+        process_logger.critical("Stage 1 Critical Error: No output file path was specified for the msgpack file. Aborting analysis.")
+        if progress_callback:
+            progress_callback(0, 0, "Stage 1 Error: No output path specified.", 0, 0, 0)
+        return None, 0.0
+
+    if app_logger_config_arg and app_logger_config_arg.get('log_file') and app_logger_config_arg.get(
+            'log_level') is not None:
+        fallback_config_for_subprocesses = {
+            'log_file': app_logger_config_arg['log_file'],
+            'log_level': app_logger_config_arg['log_level']
+        }
+    elif process_logger.handlers:
+        for h in process_logger.handlers:
+            if isinstance(h, logging.FileHandler):
+                fallback_config_for_subprocesses = {
+                    'log_file': h.baseFilename,
+                    'log_level': process_logger.level
+                }
+                break
+    if not fallback_config_for_subprocesses:
+        fallback_config_for_subprocesses = {'log_file': None, 'log_level': logging.INFO}
+
+    process_logger.info(f"Stage 1 YOLO Analysis started with orchestrator logger: {process_logger.name}")
+
+    if not os.path.exists(yolo_pose_model_path_arg):
+        msg = "Error: YOLO Pose model not found"
+        process_logger.error(msg)
+        if progress_callback: progress_callback(0, 0, msg, 0, 0, 0)
+        return None, 0.0
+
+    s1_start_time = time.time()
+    stop_event_internal = Event()
+
+    def monitor_external_stop():
+        stop_event_external.wait()
+        if not stop_event_internal.is_set():
+            process_logger.info("[S1 Lib Monitor] External stop received. Relaying to internal stop event.")
+            stop_event_internal.set()
+
+    stop_monitor_thread = PyThread(target=monitor_external_stop, daemon=True)
+    stop_monitor_thread.start()
+
+    queue_monitor = Stage1QueueMonitor()
+
+    # --- Preprocessed Video Logic (Now Optional) ---
+    video_path_to_use = video_path_arg
+    video_type_to_use = video_type_arg
+    is_encoding_preprocessed_video = False
+
+    # Default to multiple producers. Only use 1 if we are actively encoding.
+    num_producers_effective = num_producers_arg
+
+    if save_preprocessed_video_arg:
+        process_logger.info("Preprocessed video generation/reuse is ENABLED for Stage 1.")
+        
+        # CRITICAL: Check if the input video is already preprocessed to prevent double preprocessing
+        if _is_already_preprocessed_video(video_path_arg, process_logger):
+            process_logger.error("REFUSING TO PROCESS: Input video appears to be already preprocessed!")
+            process_logger.error("Double preprocessing can corrupt the output and waste resources.")
+            process_logger.error("Please use the original video file for processing.")
+            return None, 0.0
+        
+        if preprocessed_video_path_arg and os.path.exists(preprocessed_video_path_arg):
+            process_logger.info(f"Found existing preprocessed video. Using: {preprocessed_video_path_arg}")
+            video_path_to_use = preprocessed_video_path_arg
+            video_type_to_use = 'flat'
+        elif preprocessed_video_path_arg:
+            process_logger.info(f"No existing preprocessed video found. Will encode to: {preprocessed_video_path_arg}")
+            is_encoding_preprocessed_video = True
+            num_producers_effective = 1  # Force producers to 1 for safe encoding to a single file
+            preprocessed_dir = os.path.dirname(preprocessed_video_path_arg)
+            if preprocessed_dir:
+                os.makedirs(preprocessed_dir, exist_ok=True)
+        else:
+            # This case is a safeguard; the calling function should prevent it.
+            process_logger.warning("Save preprocessed video was enabled, but no output path was provided. Disabling feature for this run.")
+    else:
+        process_logger.info("Preprocessed video generation/reuse is DISABLED for Stage 1.")
+
+    class VPAppProxy:
+        pass
+
+    vp_app_proxy = VPAppProxy()
+    vp_app_proxy.hardware_acceleration_method = hwaccel_method_arg
+    vp_app_proxy.available_ffmpeg_hwaccels = hwaccel_avail_list_arg if hwaccel_avail_list_arg is not None else []
+    # Force v360 unwarp method for offline tracking to avoid low FPS with GPU unwarp (metal/opengl)
+    vp_app_proxy.app_settings = {'vr_unwarp_method': 'v360'}
+
+    main_vp_for_info = VideoProcessor(app_instance=vp_app_proxy,
+                                      fallback_logger_config={'logger_instance': process_logger})
+
+    if not main_vp_for_info.open_video(video_path_to_use):
+        return None, 0.0
+    full_video_total_frames = main_vp_for_info.video_info.get('total_frames', 0)
+    video_fps = main_vp_for_info.video_info.get('fps', 30.0)
+    main_vp_for_info.reset(close_video=True)
+    del main_vp_for_info
+
+    processing_start_frame = 0
+    processing_end_frame = full_video_total_frames - 1
+    if frame_range_arg:
+        start, end = frame_range_arg
+        if start is not None: processing_start_frame = start
+        if end is not None and end != -1: processing_end_frame = end
+    total_frames_to_process = processing_end_frame - processing_start_frame + 1
+    if total_frames_to_process <= 0:
+        return None, 0.0
+
+    frame_processing_queue = Queue(maxsize=constants.STAGE1_FRAME_QUEUE_MAXSIZE)
+    yolo_result_queue = Queue()
+    producers_list, consumers_list = [], []
+    logger_p_thread = None
+    max_fps_container = [0.0, time.time()]  # [max_fps, last_progress_time]
+
+    try:
+        # --- PROCESS CREATION ---
+        frames_per_producer = total_frames_to_process // num_producers_effective
+        extra_frames = total_frames_to_process % num_producers_effective
+        current_frame = processing_start_frame
+        for i in range(num_producers_effective):
+            num_frames = frames_per_producer + (1 if i < extra_frames else 0)
+            if num_frames > 0:
+                encoding_path_arg = preprocessed_video_path_arg if is_encoding_preprocessed_video else None
+                p_args = (i, video_path_to_use, yolo_input_size_arg, video_type_to_use, vr_input_format_arg, vr_fov_arg,
+                          vr_pitch_arg, current_frame, num_frames, frame_processing_queue, queue_monitor,
+                          stop_event_internal, hwaccel_method_arg, hwaccel_avail_list_arg,
+                          fallback_config_for_subprocesses, is_encoding_preprocessed_video, encoding_path_arg)
+                producers_list.append(Process(target=video_processor_producer_proc, args=p_args, daemon=True))
+                current_frame += num_frames
+
+        # MPS: all consumers share one model in the parent process. Skips
+        # N x 540ms warmup + ~3GB per-process duplicate weights. Probed
+        # thread-safe and slightly faster (~+10%) on a 4-thread test.
+        use_threaded_consumers = (
+            getattr(constants, 'STAGE1_USE_THREADED_CONSUMERS_ON_MPS', True)
+            and str(constants.DEVICE) == 'mps'
+        )
+        shared_consumer_models = None
+        if use_threaded_consumers:
+            try:
+                from tracker.tracker_modules.helpers.yolo_detection_helper import load_model
+                process_logger.info(
+                    "[S1 Lib] MPS: loading one shared YOLO det+pose for all consumers.")
+                _shared_det = load_model(
+                    yolo_model_path_arg, task='detect',
+                    warmup_device=constants.DEVICE, warmup_imgsz=yolo_input_size_arg,
+                )
+                _shared_pose = load_model(
+                    yolo_pose_model_path_arg, task='pose',
+                    warmup_device=constants.DEVICE, warmup_imgsz=yolo_input_size_arg,
+                )
+                shared_consumer_models = (_shared_det, _shared_pose)
+            except Exception as e:
+                process_logger.warning(
+                    f"[S1 Lib] Shared-model load failed ({e}); falling back to per-process.")
+                use_threaded_consumers = False
+
+        for i in range(num_consumers_arg):
+            c_args = (frame_processing_queue, yolo_result_queue, i, yolo_model_path_arg, yolo_pose_model_path_arg,
+                      confidence_threshold, yolo_input_size_arg, queue_monitor, stop_event_internal,
+                      fallback_config_for_subprocesses, video_fps,
+                      shared_consumer_models if use_threaded_consumers else None)
+            if use_threaded_consumers:
+                consumers_list.append(PyThread(
+                    target=consumer_proc, args=c_args, daemon=True,
+                    name=f"S1ConsumerThread-{i}"))
+            else:
+                consumers_list.append(Process(target=consumer_proc, args=c_args, daemon=True))
+
+        logger_thread_args = (frame_processing_queue, yolo_result_queue, result_file_local, total_frames_to_process,
+                              progress_callback, queue_monitor, stop_event_internal,
+                              s1_start_time, process_logger, gui_event_queue_arg, max_fps_container,
+                              processing_start_frame)
+
+        logger_p_thread = PyThread(target=logger_proc, args=logger_thread_args, daemon=True)
+
+        # --- PROCESS STARTUP ---
+        for p in producers_list:
+            p.start()
+        for p in consumers_list:
+            p.start()
+        logger_p_thread.start()
+
+        # --- PROCESS JOINING AND SENTINEL LOGIC ---
+        producers_finished = False
+        all_procs = producers_list + consumers_list
+        loop_start_time = time.time()
+        ANALYSIS_TIMEOUT_SECONDS = 60  # 1 minute (autotune only)
+        STALL_TIMEOUT_SECONDS = 60  # 1 minute with no progress = stalled (partial results saved)
+
+        while any(p.is_alive() for p in all_procs):
+            # Conditionally check for timeout ONLY if it's an autotuner run
+            if is_autotune_run_arg and (time.time() - loop_start_time > ANALYSIS_TIMEOUT_SECONDS):
+                process_logger.critical(
+                    f"[S1 Lib] Autotuner analysis timed out after {ANALYSIS_TIMEOUT_SECONDS} seconds. "
+                    "A subprocess likely hung. Aborting this test."
+                )
+                if not stop_event_internal.is_set():
+                    stop_event_internal.set()
+                break  # Exit the monitoring loop to trigger cleanup
+
+            # Stall detection: if no results have been written for STALL_TIMEOUT_SECONDS, abort
+            if not is_autotune_run_arg:
+                last_progress = max_fps_container[1]
+                if time.time() - last_progress > STALL_TIMEOUT_SECONDS:
+                    process_logger.critical(
+                        f"[S1 Lib] Pipeline stalled — no progress for {STALL_TIMEOUT_SECONDS} seconds. "
+                        "Workers may be deadlocked. Aborting."
+                    )
+                    if not stop_event_internal.is_set():
+                        stop_event_internal.set()
+                    break
+
+            # If an abort is requested, break the loop immediately to trigger cleanup.
+            if stop_event_internal.is_set():
+                process_logger.warning("[S1 Lib] Abort detected in main monitoring loop.")
+                break
+
+            # Check if all producers are finished.
+            if not producers_finished and not any(p.is_alive() for p in producers_list):
+                process_logger.info("[S1 Lib] All producers finished. Sending sentinels to consumers.")
+                for _ in range(len(consumers_list)):
+                    queue_monitor.frame_queue_put(frame_processing_queue, None)
+                producers_finished = True
+
+            time.sleep(0.5)  # Wait between checks to avoid busy-waiting.
+
+        # After the main loop, check if it was a natural finish (not an abort).
+        if not stop_event_internal.is_set():
+            process_logger.info("[S1 Lib] All consumers finished. Sending end-of-stream sentinel to logger.")
+            try:
+                yolo_result_queue.put((None, None), timeout=1.0)
+            except Full:
+                process_logger.warning("[S1 Lib] Timed out sending sentinel to logger queue.")
+
+        # Final wait for the logger thread to finish writing the file.
+        if logger_p_thread.is_alive():
+            logger_p_thread.join()
+
+        if stop_event_external.is_set():
+            # Clean up incomplete preprocessed video on abort to prevent reuse
+            if is_encoding_preprocessed_video and preprocessed_video_path_arg and os.path.exists(preprocessed_video_path_arg):
+                process_logger.warning(f"Abort detected - removing incomplete preprocessed video: {preprocessed_video_path_arg}")
+                _cleanup_incomplete_file(preprocessed_video_path_arg, process_logger)
+            return None, 0.0
+
+        final_max_fps = max_fps_container[0]
+        process_logger.info(f"Stage 1 analysis completed. Final Max FPS: {final_max_fps:.2f}")
+
+        # Final validation of both preprocessed video and msgpack file
+        result_success = True
+        if os.path.exists(result_file_local):
+            if not _validate_preprocessed_file_completeness(result_file_local, total_frames_to_process, process_logger):
+                process_logger.error(f"Stage 1 msgpack file validation failed: {result_file_local}")
+                _cleanup_incomplete_file(result_file_local, process_logger)
+                result_success = False
+        else:
+            result_success = False
+
+        # Validate preprocessed video if it was created
+        if is_encoding_preprocessed_video and preprocessed_video_path_arg:
+            if os.path.exists(preprocessed_video_path_arg):
+                if not _validate_preprocessed_video_completeness(preprocessed_video_path_arg, total_frames_to_process, video_fps, process_logger):
+                    process_logger.error(f"Preprocessed video validation failed: {preprocessed_video_path_arg}")
+                    _cleanup_incomplete_file(preprocessed_video_path_arg, process_logger)
+                    # Don't fail the entire stage if just the preprocessed video is bad
+                    # result_success = False
+
+        return (result_file_local, final_max_fps) if result_success else (None, 0.0)
+
+
+    except Exception as e:
+        process_logger.critical(f"[S1 Lib] CRITICAL EXCEPTION in perform_yolo_analysis: {e}", exc_info=True)
+        if not stop_event_internal.is_set():
+            stop_event_internal.set()
+        return None, 0.0
+    finally:
+        # This 'finally' block ensures cleanup happens no matter what.
+        process_logger.info("[S1 Lib] Entering cleanup block.")
+        for p in producers_list + consumers_list:
+            if not p.is_alive():
+                continue
+            if hasattr(p, 'terminate'):
+                process_logger.info(f"[S1 Lib] Terminating hanging process: {p.pid}")
+                p.terminate()
+                p.join(timeout=1.0)
+            else:
+                process_logger.info(f"[S1 Lib] Joining hanging consumer thread: {p.name}")
+                p.join(timeout=2.0)
+
+        # Also ensure the logger thread is joined.
+        if logger_p_thread and logger_p_thread.is_alive():
+            logger_p_thread.join(timeout=1.0)
+        process_logger.info("[S1 Lib] Cleanup complete.")
