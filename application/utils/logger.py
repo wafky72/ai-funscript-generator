@@ -1,0 +1,246 @@
+import logging
+import inspect
+import os
+import re
+import subprocess
+from logging.handlers import RotatingFileHandler
+from config import constants
+
+
+def _read_git_info_no_subprocess(repo_root: str):
+    """Parse .git/HEAD + ref / packed-refs without spawning git."""
+    head_path = os.path.join(repo_root, '.git', 'HEAD')
+    if not os.path.isfile(head_path):
+        return None
+    try:
+        with open(head_path, 'r') as f:
+            head = f.read().strip()
+    except OSError:
+        return None
+    if head.startswith('ref: '):
+        ref_name = head[5:].strip()
+        branch = ref_name.rsplit('/', 1)[-1]
+        ref_path = os.path.join(repo_root, '.git', ref_name)
+        commit = None
+        if os.path.isfile(ref_path):
+            try:
+                with open(ref_path, 'r') as f:
+                    commit = f.read().strip()
+            except OSError:
+                commit = None
+        if commit is None:
+            packed = os.path.join(repo_root, '.git', 'packed-refs')
+            if os.path.isfile(packed):
+                try:
+                    with open(packed, 'r') as f:
+                        for line in f:
+                            if line.endswith(' ' + ref_name + '\n'):
+                                commit = line.split(' ', 1)[0]
+                                break
+                except OSError:
+                    pass
+        return f"{branch}@{commit[:7] if commit else 'unknown'}"
+    if re.fullmatch(r'[0-9a-f]{40}', head):
+        return f"detached@{head[:7]}"
+    return None
+
+
+def get_git_info():
+    """Get current git branch and commit hash for logging.
+
+    Pure file read; no subprocess. Falls back to subprocess only if the
+    repo layout is unusual.
+    """
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    info = _read_git_info_no_subprocess(repo_root)
+    if info is not None:
+        return info
+    try:
+        branch_result = subprocess.run(
+            ['git', 'branch', '--show-current'],
+            capture_output=True, text=True, timeout=2
+        )
+        branch = branch_result.stdout.strip() if branch_result.returncode == 0 else 'unknown'
+        commit_result = subprocess.run(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            capture_output=True, text=True, timeout=2
+        )
+        commit = commit_result.stdout.strip() if commit_result.returncode == 0 else 'unknown'
+        return f"{branch}@{commit}"
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
+        return "nogit@unknown"
+
+
+_GIT_INFO = get_git_info()
+
+
+class StatusMessageHandler(logging.Handler):
+    """
+    A custom logging handler to send messages to the application's status bar.
+    """
+    # Default durations for status messages based on log level
+    DEFAULT_LEVEL_DURATIONS = {
+        logging.INFO: 3.0,
+        logging.WARNING: 5.0,
+        logging.ERROR: 7.0,
+        logging.CRITICAL: 10.0,
+    }
+
+    # Log levels that trigger toast notifications (in addition to status bar)
+    _TOAST_LEVEL_MAP = {
+        logging.WARNING: "warning",
+        logging.ERROR: "error",
+        logging.CRITICAL: "error",
+    }
+
+    def __init__(self, set_status_message_func, level_durations=None, notify_func=None):
+        super().__init__()
+        self.set_status_message_func = set_status_message_func
+        self.level_durations = level_durations if level_durations is not None else self.DEFAULT_LEVEL_DURATIONS
+        self.notify_func = notify_func
+
+    def emit(self, record):
+        try:
+            show_in_status = False
+            final_duration = None
+
+            # Priority 1: Explicit 'status_message' in extra
+            # Allows forcing a message (e.g., DEBUG) to status or suppressing one.
+            if hasattr(record, 'status_message'):
+                if record.status_message is True:
+                    show_in_status = True
+                    # Use duration from extra, or from level config, or a fallback default (e.g., 3s for INFO-like forced messages)
+                    default_fallback_duration = self.level_durations.get(record.levelno, 3.0)
+                    final_duration = record.__dict__.get('duration', default_fallback_duration)
+                elif record.status_message is False:
+                    return  # Explicitly do not show in status
+
+            # Priority 2: Implicitly via log level being in configured level_durations (if not handled by Priority 1)
+            if not show_in_status and record.levelno in self.level_durations:
+                show_in_status = True
+                final_duration = self.level_durations[record.levelno]
+                # Allow 'duration' in extra to override the level-based duration
+                if hasattr(record, 'duration'):
+                    final_duration = record.duration
+
+            if show_in_status and final_duration is not None:
+                message_to_display = record.getMessage()
+                self.set_status_message_func(message_to_display, final_duration)
+
+                # Also fire toast notification for warnings and errors
+                if self.notify_func:
+                    toast_type = self._TOAST_LEVEL_MAP.get(record.levelno)
+                    if toast_type:
+                        self.notify_func(message_to_display, toast_type)
+        except Exception:
+            self.handleError(record)
+
+
+class ColoredFormatter(logging.Formatter):
+    """
+    A custom formatter to add colors to log messages based on log level.
+    Compact format for console readability.
+    """
+    GREY = "\x1b[90m"
+    GREEN = "\x1b[32m"
+    YELLOW = "\x1b[33m"
+    RED = "\x1b[31m"
+    BOLD_RED = "\x1b[31;1m"
+    RESET = "\x1b[0m"
+
+    # Compact console format: time level [module:line] message
+    log_format_base = "%(asctime)s %(levelname)-5s [%(module)s:%(lineno)d] %(message)s"
+
+    FORMATS = {
+        logging.DEBUG: GREY + log_format_base + RESET,
+        logging.INFO: GREEN + log_format_base + RESET,
+        logging.WARNING: YELLOW + log_format_base + RESET,
+        logging.ERROR: RED + log_format_base + RESET,
+        logging.CRITICAL: BOLD_RED + log_format_base + RESET
+    }
+
+    def format(self, record):
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt, datefmt='%H:%M:%S')
+        return formatter.format(record)
+
+
+class AppLogger:
+    """
+    A wrapper class to simplify the creation and configuration of a logger.
+    """
+
+    def __init__(self, level=logging.DEBUG, log_file=None,
+                 app_logic_instance=None, status_level_durations=None):
+        """
+        Initializes and configures the root logger for the entire application.
+
+        Args:
+            level (int, optional): The master logging level. Defaults to logging.DEBUG.
+            log_file (str, optional): Path to a file to save logs.
+            app_logic_instance (object, optional): Instance for status messages.
+            status_level_durations (dict, optional): Durations for status messages.
+        """
+        # Configure the root logger directly to ensure consistency.
+        self.logger = logging.getLogger()  # Get the root logger
+        self.logger.setLevel(level)
+
+        # Clear any existing handlers to prevent duplicates from previous runs or basicConfig.
+        if self.logger.hasHandlers():
+            self.logger.handlers.clear()
+
+        # Console Handler with colors (compact format)
+        ch = logging.StreamHandler()
+        ch.setLevel(level)
+        ch.setFormatter(ColoredFormatter())
+        self.logger.addHandler(ch)
+
+        # File Handler (optional) — verbose format for bug reports
+        if log_file:
+            fh = RotatingFileHandler(
+                log_file,
+                mode='a',
+                maxBytes=getattr(constants, 'LOG_MAX_BYTES', 5 * 1024 * 1024),
+                backupCount=getattr(constants, 'LOG_BACKUP_COUNT', 3),
+                encoding='utf-8'
+            )
+            fh.setLevel(level)
+            file_formatter = logging.Formatter(
+                f"%(asctime)s - [{_GIT_INFO}] - %(name)s - %(levelname)-8s - [%(module)s.%(funcName)s:%(lineno)d] - %(message)s",
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            fh.setFormatter(file_formatter)
+            self.logger.addHandler(fh)
+
+        # Status Message Handler (optional)
+        if app_logic_instance and hasattr(app_logic_instance, 'set_status_message'):
+            notify_func = getattr(app_logic_instance, 'notify', None)
+            smh = StatusMessageHandler(app_logic_instance.set_status_message,
+                                       level_durations=status_level_durations,
+                                       notify_func=notify_func)
+            smh.setLevel(level)
+            self.logger.addHandler(smh)
+
+    def set_level(self, level):
+        """Update logging level on root logger AND all handlers."""
+        self.logger.setLevel(level)
+        for handler in self.logger.handlers:
+            # Don't change StatusMessageHandler level — it uses its own filtering
+            if not isinstance(handler, StatusMessageHandler):
+                handler.setLevel(level)
+
+    def get_logger(self):
+        """
+        Returns the configured logger instance.
+        """
+        # Since we configured the root, any call to getLogger will use this config.
+        return logging.getLogger(self.get_caller_name())
+
+    def get_caller_name(self):
+        """Helper to get the name of the module that called get_logger."""
+        try:
+            frm = inspect.stack()[2] # 2 levels up to get the caller of get_logger
+            mod = inspect.getmodule(frm[0])
+            return mod.__name__ if mod else '__main__'
+        except IndexError:
+            return 'unknown_module'
