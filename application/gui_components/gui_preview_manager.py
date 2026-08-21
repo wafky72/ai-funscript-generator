@@ -1,0 +1,551 @@
+"""Preview and heatmap generation mixin for GUI."""
+import numpy as np
+import cv2
+import time
+import queue
+import imgui
+
+from application.utils import _format_time, TaskType, TaskPriority
+from config.constants_colors import CurrentTheme
+
+
+class PreviewManagerMixin:
+    """Mixin providing preview generation and heatmap rendering methods."""
+
+    # --- Worker thread for generating preview images ---
+    def _preview_generation_worker(self):
+        """
+        Runs in a background thread. Waits for tasks and processes them.
+        """
+        while not self.shutdown_event.is_set():
+            try:
+                task = self.preview_task_queue.get(timeout=0.1)
+                task_type = task['type']
+
+                if task_type == 'timeline':
+                    image_data = self._generate_funscript_preview_data(
+                        task['target_width'],
+                        task['target_height'],
+                        task['total_duration_s'],
+                        task['actions']
+                    )
+                    self.preview_results_queue.put({'type': 'timeline', 'image_data': image_data})
+
+                elif task_type == 'heatmap':
+                    image_data = self._generate_heatmap_data(
+                        task['target_width'],
+                        task['target_height'],
+                        task['total_duration_s'],
+                        task['actions']
+                    )
+                    self.preview_results_queue.put({'type': 'heatmap', 'image_data': image_data})
+
+                self.preview_task_queue.task_done()
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                self.app.logger.error(f"Error in preview generation worker: {e}", exc_info=True)
+
+    # --- Method to handle completed preview data from the queue ---
+    def _process_preview_results(self):
+        """
+        Called in the main render loop to process any completed preview images.
+        """
+        try:
+            while not self.preview_results_queue.empty():
+                result = self.preview_results_queue.get_nowait()
+
+                result_type = result.get('type')
+                image_data = result.get('image_data')
+
+                if image_data is None:
+                    continue
+
+                if result_type == 'timeline':
+                    self.update_texture(self.funscript_preview_texture_id, image_data)
+                elif result_type == 'heatmap':
+                    self.update_texture(self.heatmap_texture_id, image_data)
+
+                self.preview_results_queue.task_done()
+
+        except queue.Empty:
+            pass  # No results to process
+        except Exception as e:
+            self.app.logger.error(f"Error processing preview results: {e}", exc_info=True)
+
+    def submit_async_processing_task(
+        self,
+        task_id: str,
+        task_type: TaskType,
+        function,
+        args=(),
+        kwargs=None,
+        priority: TaskPriority = TaskPriority.NORMAL,
+        name: str = "Processing",
+        show_in_status: bool = True
+    ):
+        """
+        Submit a processing task to run asynchronously without blocking the UI.
+
+        Args:
+            task_id: Unique identifier for the task
+            task_type: Type of processing task
+            function: Function to execute
+            args: Function arguments
+            kwargs: Function keyword arguments
+            priority: Task priority
+            name: Human-readable name for progress display
+            show_in_status: Whether to show progress in status bar
+        """
+        # Track the operation
+        self.active_threaded_operations[task_id] = {
+            'name': name,
+            'show_in_status': show_in_status,
+            'progress': 0.0,
+            'message': 'Starting...',
+            'started_time': time.time()
+        }
+
+        # Submit to processing thread manager
+        def completion_callback(result):
+            # Clean up tracking
+            if task_id in self.active_threaded_operations:
+                del self.active_threaded_operations[task_id]
+            self.app.logger.info(f"Async task {task_id} completed successfully")
+
+        def error_callback(error):
+            # Clean up tracking and show error
+            if task_id in self.active_threaded_operations:
+                del self.active_threaded_operations[task_id]
+            self.app.logger.error(f"Async task {task_id} failed: {error}")
+            self.app.set_status_message(f"Error in {name}: {str(error)}", duration=5.0)
+
+        self.processing_thread_manager.submit_task(
+            task_id=task_id,
+            task_type=task_type,
+            function=function,
+            args=args,
+            kwargs=kwargs or {},
+            priority=priority,
+            completion_callback=completion_callback,
+            error_callback=error_callback
+        )
+
+        self.app.logger.info(f"Submitted async task: {task_id} ({name})")
+
+    # --- Extracted CPU-intensive drawing logic for timeline ---
+    def _generate_funscript_preview_data(self, target_width, target_height, total_duration_s, actions):
+        """
+        Performs the numpy/cv2 operations to create the timeline image.
+        This is called by the worker thread.
+        """
+        use_simplified_preview = self.app.app_settings.config.ui.use_simplified_funscript_preview
+
+        # Create background
+        image_data = np.full((target_height, target_width, 4), (38, 31, 31, 255), dtype=np.uint8)
+        center_y_px = target_height // 2
+        cv2.line(image_data, (0, center_y_px), (target_width - 1, center_y_px), (77, 77, 77, 179), 1)
+
+        if not actions or total_duration_s <= 0.001:
+            return image_data
+
+        if use_simplified_preview:
+            if len(actions) < 2: return image_data
+
+            # --- Simplified Min/Max Envelope Drawing ---
+            # Note on perf: tried vectorizing the per-segment interpolation
+            # with np.minimum.at + np.linspace — benchmarks showed ~2.6x
+            # SLOWER at realistic sizes (~5000 actions / 4096 px width)
+            # because most segments span 0-2 pixels and the numpy setup
+            # cost dominates. Keep the tight Python inner loop.
+            min_vals = np.full(target_width, target_height, dtype=np.int32)
+            max_vals = np.full(target_width, -1, dtype=np.int32)
+
+            # Pre-calculate x coordinates and values
+            n = len(actions)
+            times_s = np.fromiter((a['at'] for a in actions), dtype=np.float64, count=n) / 1000.0
+            positions = np.fromiter((a['pos'] for a in actions), dtype=np.float64, count=n)
+            x_coords = np.round((times_s / total_duration_s) * (target_width - 1)).astype(np.int32)
+            y_coords = np.round((1.0 - positions / 100.0) * (target_height - 1)).astype(np.int32)
+
+            # Find min/max y for each x (per-pixel interp — fast for short spans)
+            for i in range(len(actions) - 1):
+                x1, x2 = x_coords[i], x_coords[i+1]
+                y1, y2 = y_coords[i], y_coords[i+1]
+
+                if x1 == x2:
+                    min_vals[x1] = min(min_vals[x1], y1, y2)
+                    max_vals[x1] = max(max_vals[x1], y1, y2)
+                else:
+                    dx = x2 - x1
+                    dy = y2 - y1
+                    for x in range(x1, x2 + 1):
+                        y = y1 + dy * (x - x1) / dx
+                        y_int = int(round(y))
+                        min_vals[x] = min(min_vals[x], y_int)
+                        max_vals[x] = max(max_vals[x], y_int)
+
+            # Build polygon points from columns that received data (vectorized).
+            valid = max_vals != -1
+            if not valid.any():
+                return image_data
+            valid_x = np.nonzero(valid)[0].astype(np.int32)
+            min_y = min_vals[valid_x]
+            max_y = max_vals[valid_x]
+            min_points = np.stack([valid_x, min_y], axis=1)
+            max_points_rev = np.stack([valid_x[::-1], max_y[::-1]], axis=1)
+            poly_points = np.concatenate([min_points, max_points_rev], axis=0).astype(np.int32)
+
+            # Draw the semi-transparent polygon
+            overlay = image_data.copy()
+            envelope_color_rgba = self.app.utility.get_speed_color_from_map(500) # Use a mid-range speed color
+            envelope_color_bgra = (int(envelope_color_rgba[2] * 255), int(envelope_color_rgba[1] * 255), int(envelope_color_rgba[0] * 255), 100) # 100 for alpha
+            cv2.fillPoly(overlay, [poly_points], envelope_color_bgra)
+            cv2.addWeighted(overlay, 0.5, image_data, 0.5, 0, image_data) # Blend with background
+
+        else:
+            # --- Detailed, Speed-Colored Line Drawing ---
+            if len(actions) > 1:
+                n = len(actions)
+                ats = np.fromiter((a['at'] for a in actions), dtype=np.float64, count=n) / 1000.0
+                pos = np.fromiter((a['pos'] for a in actions), dtype=np.float32, count=n) / 100.0
+                x = np.clip(((ats / total_duration_s) * (target_width - 1)).astype(np.int32), 0, target_width - 1)
+                y = np.clip(((1.0 - pos) * target_height).astype(np.int32), 0, target_height - 1)
+                dt = np.diff(ats)
+                dpos = np.abs(np.diff(pos * 100.0))
+                speeds = np.divide(dpos, dt, out=np.zeros_like(dpos), where=dt > 1e-6)
+                colors_u8 = self.app.utility.get_speed_colors_vectorized_u8(speeds)  # RGBA uint8
+
+                # Pre-convert RGBA→BGRA tuples once (was per-iteration int()
+                # conversion before). Also pre-compute zero-length mask.
+                bgra = colors_u8[:, [2, 1, 0, 3]]  # swap R<->B; vectorized
+                zero_len = (x[:-1] == x[1:]) & (y[:-1] == y[1:])
+                # Convert endpoints to Python ints once, hoist cv2.line to local
+                x_list = x.tolist()
+                y_list = y.tolist()
+                bgra_list = bgra.tolist()
+                _cv_line = cv2.line
+                for i in range(len(speeds)):
+                    if zero_len[i]:
+                        continue
+                    c = bgra_list[i]
+                    _cv_line(image_data, (x_list[i], y_list[i]), (x_list[i+1], y_list[i+1]),
+                             (c[0], c[1], c[2], c[3]), 1)
+
+        return image_data
+
+    # --- Extracted CPU-intensive drawing logic for heatmap ---
+    # Texture width is fixed and independent of display width: GPU stretches
+    # the 1-pixel-tall strip to the on-screen bar via the imgui quad. This
+    # eliminates regen on every panel resize and shrinks the texture upload
+    # from H*W*4 bytes to W*4 bytes.
+    HEATMAP_TEX_WIDTH = 4096
+
+    def _generate_heatmap_data(self, target_width, target_height, total_duration_s, actions):
+        """Build a 1xW RGBA strip whose width is independent of display size.
+
+        target_width / target_height are accepted for API compatibility but
+        ignored — the texture is always HEATMAP_TEX_WIDTH pixels wide and
+        1 pixel tall. The GPU stretches it at draw time.
+        """
+        W = self.HEATMAP_TEX_WIDTH
+        colors = self.colors
+        image_data = np.full((1, W, 4), colors.HEATMAP_BACKGROUND, dtype=np.uint8)
+
+        if len(actions) > 1 and total_duration_s > 0.001:
+            ats = np.array([a['at'] for a in actions], dtype=np.float64) / 1000.0
+            poss = np.array([a['pos'] for a in actions], dtype=np.float32)
+            x_coords = ((ats / total_duration_s) * (W - 1)).astype(np.int32)
+            x_coords = np.clip(x_coords, 0, W - 1)
+            dt = np.diff(ats)
+            dpos = np.abs(np.diff(poss))
+            speeds = np.divide(dpos, dt, out=np.zeros_like(dpos), where=dt > 1e-6)
+            colors_u8 = self.app.utility.get_speed_colors_vectorized_u8(speeds)
+            cols = np.arange(W, dtype=np.int32)
+            seg_idx_for_col = np.searchsorted(x_coords, cols, side='right') - 1
+            valid_mask = seg_idx_for_col >= 0
+            seg_idx_for_col = np.clip(seg_idx_for_col, 0, len(speeds) - 1)
+            col_colors = np.zeros((W, 4), dtype=np.uint8)
+            if np.any(valid_mask):
+                col_colors[valid_mask] = colors_u8[seg_idx_for_col[valid_mask]]
+                col_colors[valid_mask, 3] = 255
+            if np.any(~valid_mask):
+                col_colors[~valid_mask, 3] = 0
+            image_data[0, :, :] = col_colors
+
+        return image_data
+
+    def _generate_instant_tooltip_data(self, hover_time_s: float, hover_frame: int, total_duration: float, normalized_pos: float, include_frame: bool = False):
+        """Generate cached tooltip data with instant funscript zoom and optional delayed video frame."""
+        tooltip_data = {
+            'hover_time_s': hover_time_s,
+            'hover_frame': hover_frame,
+            'total_duration': total_duration,
+            'zoom_actions': [],
+            'zoom_start_s': 0,
+            'zoom_end_s': 0,
+            'frame_data': None,
+            'frame_loading': include_frame,  # Set to True immediately if frame will be fetched
+            'actual_frame': None  # Track actual frame if different from requested
+        }
+
+        # Funscript zoom preview (±2 seconds window around hover point) - INSTANT
+        zoom_window_s = 4.0  # Total window size in seconds
+        zoom_start_s = max(0, hover_time_s - zoom_window_s/2)
+        zoom_end_s = min(total_duration, hover_time_s + zoom_window_s/2)
+        tooltip_data['zoom_start_s'] = zoom_start_s
+        tooltip_data['zoom_end_s'] = zoom_end_s
+
+        # Get funscript actions in zoom window - FAST operation
+        actions = self.app.funscript_processor.get_actions('primary')
+        if actions:
+            zoom_actions = []
+            for action in actions:
+                action_time_s = action['at'] / 1000.0
+                if zoom_start_s <= action_time_s <= zoom_end_s:
+                    zoom_actions.append(action)
+            tooltip_data['zoom_actions'] = zoom_actions
+
+        # Frame extraction is handled asynchronously by the caller to avoid blocking UI
+        # frame_loading is already set to True in dict initialization if include_frame is True
+
+        return tooltip_data
+
+    def _get_frame_direct_cv2(self, frame_index: int):
+        """Fast direct frame extraction using video processor's existing infrastructure.
+        Returns: (frame_data, actual_frame_index) or (None, None) on error
+        """
+        if not self.app.processor or not self.app.processor.video_path:
+            return None, None
+
+        import numpy as np
+
+        try:
+            # Use OpenCV-based thumbnail extractor for fast seeking (no FFmpeg process spawning!)
+            # This is much faster than spawning FFmpeg for each tooltip hover
+            # Note: This still blocks briefly for OpenCV seek, but much faster than FFmpeg
+            frame = self.app.processor.get_thumbnail_frame(frame_index)
+
+            if frame is None:
+                return None, None
+
+            # Frame is exact, no mismatch
+            actual_frame = frame_index
+            # Keep frame in BGR format - update_texture will handle BGR→RGB conversion
+
+
+            height, width = frame.shape[:2]
+            proc = self.app.processor
+            fmt = (getattr(proc, 'vr_input_format', '') or '').lower() if proc else ''
+            if fmt:
+                # VR: crop to the selected eye via vr_panel. Skip the
+                # processing-rect crop; the two combined gave "half an eye".
+                try:
+                    from video import vr_panel
+                    eye = vr_panel.read_setting(self.app.app_settings,
+                                                 default=vr_panel.EYE_LEFT)
+                    region = vr_panel.resolve_eye(fmt, eye)
+                    if not region.is_full():
+                        x0 = int(region.x * width)
+                        y0 = int(region.y * height)
+                        x1 = int((region.x + region.w) * width)
+                        y1 = int((region.y + region.h) * height)
+                        if x1 > x0 and y1 > y0:
+                            frame = frame[y0:y1, x0:x1]
+                            height, width = frame.shape[:2]
+                except Exception:
+                    pass
+            else:
+                # 2D fallback (numpy path only): strip yolo-input padding.
+                if hasattr(self.app, 'app_state_ui'):
+                    c_l, c_t, c_r, c_b = self.app.app_state_ui.get_processing_content_uv_rect()
+                    if (c_l, c_t, c_r, c_b) != (0.0, 0.0, 1.0, 1.0):
+                        y0, y1 = int(c_t * height), int(c_b * height)
+                        x0, x1 = int(c_l * width), int(c_r * width)
+                        frame = frame[y0:y1, x0:x1]
+                        height, width = frame.shape[:2]
+
+            # Resize for preview (keep aspect ratio)
+            aspect_ratio = width / height if height > 0 else 16/9
+
+            # For VR content, make preview larger since it's typically wider
+            if aspect_ratio > 1.5:  # Likely VR content (wider than standard 16:9)
+                preview_width = 240  # Bigger for VR
+                preview_height = int(preview_width / aspect_ratio)
+            else:
+                preview_width = 200  # Standard content
+                preview_height = int(preview_width / aspect_ratio)
+
+            # Resize frame for preview
+            frame_resized = cv2.resize(frame, (preview_width, preview_height), interpolation=cv2.INTER_AREA)
+
+            return frame_resized, actual_frame
+
+        except Exception as e:
+            if hasattr(self.app, 'logger'):
+                self.app.logger.debug(f"Direct cv2 frame extraction failed: {e}")
+            return None, None
+
+    def _render_instant_enhanced_tooltip(self, tooltip_data: dict, show_video_frame: bool = True):
+        """Render enhanced tooltip using cached data."""
+        imgui.begin_tooltip()
+
+        try:
+            # Time information header
+            imgui.text(f"{_format_time(self.app, tooltip_data['hover_time_s'])} / {_format_time(self.app, tooltip_data['total_duration'])}")
+
+            # Show frame number with visual indicator if video frame is available and matching
+            frame_text = f"Frame: {tooltip_data['hover_frame']}"
+            has_frame_data = tooltip_data.get('frame_data') is not None and tooltip_data.get('frame_data').size > 0
+            actual_frame = tooltip_data.get('actual_frame', tooltip_data['hover_frame'])
+            frames_match = actual_frame == tooltip_data['hover_frame']
+
+            if show_video_frame and has_frame_data and frames_match:
+                imgui.text_colored(frame_text, *CurrentTheme.GREEN)
+            elif show_video_frame and has_frame_data and not frames_match:
+                imgui.text_colored(f"{frame_text} (video: {actual_frame})", 1.0, 1.0, 0.0, 1.0)  # Yellow = mismatch warning
+            else:
+                imgui.text(frame_text)  # Normal color = no video preview yet
+
+            imgui.separator()
+
+            # Funscript zoom preview
+            zoom_actions = tooltip_data.get('zoom_actions', [])
+            if zoom_actions:
+                # Get tooltip window width for centering
+                window_width = imgui.get_window_width()
+                zoom_width = min(300, window_width - 20)  # Match popup width with padding
+                zoom_height = 80
+                draw_list = imgui.get_window_draw_list()
+                graph_pos = imgui.get_cursor_screen_pos()
+
+                # Background
+                draw_list.add_rect_filled(
+                    graph_pos[0], graph_pos[1],
+                    graph_pos[0] + zoom_width, graph_pos[1] + zoom_height,
+                    imgui.get_color_u32_rgba(0.1, 0.1, 0.1, 1.0)
+                )
+
+                # Draw funscript curve
+                zoom_start_s = tooltip_data['zoom_start_s']
+                zoom_end_s = tooltip_data['zoom_end_s']
+                hover_time_s = tooltip_data['hover_time_s']
+
+                if len(zoom_actions) > 1:
+                    for i in range(len(zoom_actions) - 1):
+                        # Calculate positions
+                        t1 = (zoom_actions[i]['at'] / 1000.0 - zoom_start_s) / (zoom_end_s - zoom_start_s)
+                        t2 = (zoom_actions[i+1]['at'] / 1000.0 - zoom_start_s) / (zoom_end_s - zoom_start_s)
+                        y1 = 1.0 - (zoom_actions[i]['pos'] / 100.0)
+                        y2 = 1.0 - (zoom_actions[i+1]['pos'] / 100.0)
+
+                        x1 = graph_pos[0] + t1 * zoom_width
+                        x2 = graph_pos[0] + t2 * zoom_width
+                        py1 = graph_pos[1] + y1 * zoom_height
+                        py2 = graph_pos[1] + y2 * zoom_height
+
+                        # Draw line segment
+                        draw_list.add_line(
+                            x1, py1, x2, py2,
+                            imgui.get_color_u32_rgba(*CurrentTheme.GREEN),
+                            2.0
+                        )
+
+                    # Draw points
+                    for action in zoom_actions:
+                        t = (action['at'] / 1000.0 - zoom_start_s) / (zoom_end_s - zoom_start_s)
+                        y = 1.0 - (action['pos'] / 100.0)
+                        x = graph_pos[0] + t * zoom_width
+                        py = graph_pos[1] + y * zoom_height
+
+                        # Highlight if near hover position
+                        is_near_hover = abs(action['at'] / 1000.0 - hover_time_s) < 0.1
+                        color = imgui.get_color_u32_rgba(*CurrentTheme.YELLOW) if is_near_hover else imgui.get_color_u32_rgba(*CurrentTheme.GREEN_LIGHT)
+                        radius = 4 if is_near_hover else 3
+
+                        draw_list.add_circle_filled(x, py, radius, color)
+
+                # Draw vertical line at hover position
+                hover_x = graph_pos[0] + ((hover_time_s - zoom_start_s) / (zoom_end_s - zoom_start_s)) * zoom_width
+                draw_list.add_line(
+                    hover_x, graph_pos[1],
+                    hover_x, graph_pos[1] + zoom_height,
+                    imgui.get_color_u32_rgba(1.0, 0.5, 0.0, 0.8),
+                    1.0
+                )
+
+                imgui.dummy(zoom_width, zoom_height)
+
+            # Video frame preview (only show if requested after delay)
+            if show_video_frame:
+                imgui.separator()
+
+                # Static-frame preview only: per-tick mpv render to a
+                # second instance was stuttering main playback. Fall back
+                # to the async numpy fetch from ThumbnailMpvQueue + texture
+                # upload (one render per cursor position, not per imgui
+                # tick).
+                frame_data = tooltip_data.get('frame_data')
+                frame_loading = tooltip_data.get('frame_loading', False)
+
+                if frame_data is not None:
+                    # Display cached frame using dedicated enhanced preview texture
+                    if hasattr(self, 'enhanced_preview_texture_id') and self.enhanced_preview_texture_id:
+                        # tooltip_data is a dict, so the previous
+                        # `hasattr(tooltip_data, '_frame_texture_updated')` guard
+                        # was always False (hasattr checks attributes, not keys),
+                        # causing update_texture to re-run every render frame.
+                        if '_frame_texture_updated' not in tooltip_data:
+                            self.update_texture(self.enhanced_preview_texture_id, frame_data)
+                            tooltip_data['_frame_texture_updated'] = True
+
+                        # Calculate dimensions to fit popup width
+                        frame_height, frame_width = frame_data.shape[:2]
+                        window_width = imgui.get_window_width()
+                        max_width = min(300, window_width - 20)  # Match graph width
+
+                        # Scale frame to fit if needed
+                        if frame_width > max_width:
+                            scale = max_width / frame_width
+                            display_width = max_width
+                            display_height = int(frame_height * scale)
+                        else:
+                            display_width = frame_width
+                            display_height = frame_height
+
+                        # Center the image
+                        available_width = imgui.get_content_region_available()[0]
+                        if display_width < available_width:
+                            imgui.set_cursor_pos_x(imgui.get_cursor_pos_x() + (available_width - display_width) / 2)
+
+                        imgui.image(self.enhanced_preview_texture_id, display_width, display_height)
+
+                        # Show VR panel info only if relevant.
+                        if hasattr(self.app, 'app_settings') and self.app.app_settings:
+                            vr_enabled = self.app.app_settings.config.vr_display.mode_enabled
+                            from video import vr_panel as _vr_panel
+                            eye_sel = _vr_panel.read_setting(
+                                self.app.app_settings,
+                                default=_vr_panel.EYE_LEFT)
+                            if vr_enabled and eye_sel != _vr_panel.EYE_FULL:
+                                imgui.text(f"[{eye_sel.upper()} eye]")
+                    else:
+                        imgui.text_disabled(f"[Frame {tooltip_data['hover_frame']} - no texture available]")
+                elif frame_loading:
+                    imgui.text_disabled(f"[Loading...]")
+                else:
+                    # More helpful error message
+                    if not self.app.processor:
+                        imgui.text_disabled("[No video processor available]")
+                    elif not self.app.processor.video_path:
+                        imgui.text_disabled("[No video loaded]")
+                    else:
+                        imgui.text_disabled(f"[Frame extraction failed]")
+
+        except Exception as e:
+            imgui.text(f"Preview Error: {str(e)[:50]}")
+            if hasattr(self.app, 'logger'):
+                self.app.logger.error(f"Enhanced preview tooltip error: {e}")
+
+        imgui.end_tooltip()

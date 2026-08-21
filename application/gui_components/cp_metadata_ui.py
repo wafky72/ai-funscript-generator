@@ -1,0 +1,118 @@
+"""Metadata Editor tab UI mixin for ControlPanelUI.
+
+Provides input fields for funscript metadata: creator, title, description,
+tags, performers, URLs, license, and notes. Persisted in project file and
+included in funscript exports.
+"""
+import imgui
+from application.utils.section_card import section_card
+
+
+_METADATA_FIELDS = [
+    ("creator", "Creator", "Author or studio name", False),
+    ("title", "Title", "Script title", False),
+    ("description", "Description", "Script description", True),
+    ("tags", "Tags", "Comma-separated tags (e.g., blowjob, cowgirl, POV)", False),
+    ("performers", "Performers", "Comma-separated performer names", False),
+    ("script_url", "Script URL", "URL where this script can be downloaded", False),
+    ("video_url", "Video URL", "URL of the source video", False),
+    ("license", "License", "License type (e.g., Free, CC-BY, etc.)", False),
+    ("notes", "Notes", "Additional notes for personal use", True),
+]
+
+
+class MetadataEditorMixin:
+    """Mixin providing Metadata tab rendering methods for ControlPanelUI."""
+
+    def _render_metadata_tab(self):
+        """Render the metadata editor panel."""
+        metadata = self._get_project_metadata()
+
+        with section_card("Script Metadata##MetadataEditor", tier="primary",
+                          open_by_default=True) as _open:
+            if not _open:
+                return
+
+            imgui.text_wrapped(
+                "Metadata is saved in your project file and included in funscript exports."
+            )
+            imgui.spacing()
+
+            # Auto-populate from video filename if fields are empty
+            if not metadata.get("creator") or not metadata.get("title"):
+                import os
+                from config.constants import APP_NAME, APP_VERSION
+                if not metadata.get("creator"):
+                    metadata["creator"] = f"{APP_NAME} v{APP_VERSION}"
+                if not metadata.get("title"):
+                    video_path = getattr(self.app, 'file_manager', None)
+                    video_path = video_path.video_path if video_path else None
+                    if video_path:
+                        basename = os.path.splitext(os.path.basename(video_path))[0]
+                        # Clean up: replace separators with spaces, strip leading numbers/IDs
+                        title = basename.replace('_', ' ').replace('.', ' ').replace('-', ' ')
+                        # Collapse multiple spaces
+                        title = ' '.join(title.split())
+                        metadata["title"] = title
+                self._set_project_metadata(metadata)
+
+            changed = False
+            for key, label, tooltip, is_multiline in _METADATA_FIELDS:
+                current_value = metadata.get(key, "")
+                if current_value is None:
+                    current_value = ""
+
+                imgui.text(label)
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip(tooltip)
+
+                imgui.push_item_width(-1)
+                if is_multiline:
+                    c, new_value = imgui.input_text_multiline(
+                        f"##{key}_meta",
+                        current_value,
+                        2048,
+                        width=-1,
+                        height=60,
+                    )
+                else:
+                    c, new_value = imgui.input_text(
+                        f"##{key}_meta",
+                        current_value,
+                        512,
+                    )
+                imgui.pop_item_width()
+
+                if c:
+                    metadata[key] = new_value
+                    changed = True
+
+                imgui.spacing()
+
+            if changed:
+                self._set_project_metadata(metadata)
+
+    def _get_project_metadata(self):
+        """Read metadata from project manager."""
+        pm = getattr(self.app, 'project_manager', None)
+        if pm and hasattr(pm, 'get_metadata'):
+            meta = pm.get_metadata()
+            # Sync any orphaned fallback data into project_manager
+            fallback = getattr(self.app, '_project_metadata', None)
+            if fallback:
+                for k, v in fallback.items():
+                    meta.setdefault(k, v)
+                del self.app._project_metadata
+            return meta
+        if not hasattr(self.app, '_project_metadata'):
+            self.app._project_metadata = {}
+        return self.app._project_metadata
+
+    def _set_project_metadata(self, metadata):
+        """Write metadata to project manager and mark dirty."""
+        pm = getattr(self.app, 'project_manager', None)
+        if pm and hasattr(pm, 'set_metadata'):
+            pm.set_metadata(metadata)
+            pm.project_dirty = True
+        else:
+            self.app._project_metadata = metadata
