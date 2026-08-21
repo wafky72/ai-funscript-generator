@@ -1,0 +1,89 @@
+"""Shared imgui utility classes."""
+
+import imgui
+
+
+_U32_CONST_CACHE = {}
+
+
+def u32_const(color):
+    """Return imgui.get_color_u32_rgba(*color) cached by tuple key.
+
+    Use for theme-static RGBA tuples called per-frame. NOT for colors with
+    a runtime-varying alpha multiplier -- those need per-frame computation
+    or a quantized cache; see drawing_mixin._u32_alpha_blend for that shape.
+    """
+    key = tuple(color)
+    u = _U32_CONST_CACHE.get(key)
+    if u is None:
+        u = imgui.get_color_u32_rgba(*key)
+        _U32_CONST_CACHE[key] = u
+    return u
+
+
+def tooltip_if_hovered(text):
+    """Show a tooltip when the last imgui item is hovered."""
+    if imgui.is_item_hovered():
+        imgui.set_tooltip(text)
+
+
+def center_next_window(width, height=0):
+    """Position the next window centered on the main viewport.
+
+    Args:
+        width: Window width in pixels.
+        height: Window height (0 = auto-resize vertical).
+    """
+    mv = imgui.get_main_viewport()
+    pos_x = mv.pos[0] + (mv.size[0] - width) * 0.5
+    pos_y = mv.pos[1] + (mv.size[1] - max(height, 300)) * 0.5
+    imgui.set_next_window_position(pos_x, pos_y, condition=imgui.APPEARING)
+    imgui.set_next_window_size(width, height, condition=imgui.APPEARING)
+
+
+def center_next_window_pivot():
+    """Center the next window on the main viewport without needing to know
+    its size in advance. Uses pivot=(0.5, 0.5) so imgui places the window's
+    center at the viewport's center. Applies only on first appearance, so
+    subsequent user drags are preserved.
+    """
+    mv = imgui.get_main_viewport()
+    cx = mv.pos[0] + mv.size[0] * 0.5
+    cy = mv.pos[1] + mv.size[1] * 0.5
+    imgui.set_next_window_position(cx, cy, condition=imgui.APPEARING,
+                                    pivot_x=0.5, pivot_y=0.5)
+
+
+def begin_modal_centered(name, width, height=0):
+    """Open and begin a centered modal popup with auto-resize.
+
+    Returns True if the popup is open and content should be rendered.
+    Caller must call ``imgui.end_popup()`` when done.
+    """
+    imgui.open_popup(name)
+    center_next_window(width, height)
+    opened, _ = imgui.begin_popup_modal(
+        name, True, flags=imgui.WINDOW_ALWAYS_AUTO_RESIZE
+    )
+    return opened
+
+
+class DisabledScope:
+    """Context manager to disable imgui widgets with reduced alpha and desaturated text."""
+    __slots__ = ("active",)
+
+    def __init__(self, active):
+        self.active = active
+        if active:
+            imgui.internal.push_item_flag(imgui.internal.ITEM_DISABLED, True)
+            imgui.push_style_var(imgui.STYLE_ALPHA, imgui.get_style().alpha * 0.45)
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.5, 0.5, 0.5, 0.7)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.active:
+            imgui.pop_style_color()
+            imgui.pop_style_var()
+            imgui.internal.pop_item_flag()
