@@ -1,0 +1,649 @@
+#!/usr/bin/env python3
+"""
+FunGen installer. Stdlib-only.
+
+Designed to be invoked three ways, all interchangeable:
+  1. From a clone:  python install.py
+  2. From a shim:   install.bat / install.sh   (bootstraps uv, then runs us)
+  3. From a URL:    uv run --no-project --python 3.11 https://.../install.py
+
+In modes 2 and 3, the script may be running from a temp cache (uv downloads
+remote scripts there). It locates or clones the FunGen repo into the user's
+current working directory before doing anything else.
+
+Builds a self-contained .venv inside the project, picks the right torch wheel
+channel for the GPU it finds, then asks (once) whether to clean up any leftover
+miniconda FunGen env from older installs.
+
+Re-runnable: blowing away .venv and re-running always lands on a known-good
+environment for the current machine.
+"""
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+import zipfile
+from pathlib import Path
+
+WIN = platform.system() == "Windows"
+REPO_HTTPS = "https://github.com/ack00gar/FunGen-AI-Powered-Funscript-Generator.git"
+REPO_ZIP = "https://github.com/ack00gar/FunGen-AI-Powered-Funscript-Generator/archive/refs/heads/main.zip"
+
+
+def _find_or_clone_project() -> Path:
+    """Return the FunGen project root, cloning the repo into cwd/FunGen if missing."""
+    # 1. Are we inside a FunGen checkout? (locally-invoked python install.py)
+    here = Path(__file__).parent.resolve()
+    if (here / "requirements" / "base.txt").exists():
+        return here
+
+    # 2. Did the user cd into a FunGen checkout? (uv-from-URL invocation)
+    cwd = Path.cwd().resolve()
+    if (cwd / "requirements" / "base.txt").exists():
+        return cwd
+
+    # 3. Has a previous run already cloned ./FunGen/?
+    sub = cwd / "FunGen"
+    if (sub / "requirements" / "base.txt").exists():
+        return sub
+
+    # 4. Nothing here. Clone the repo into ./FunGen/.
+    print()
+    print(f"== Fetching FunGen source into {sub} ==")
+    sub.parent.mkdir(parents=True, exist_ok=True)
+    if not shutil.which("git"):
+        _try_install_git()
+    if shutil.which("git"):
+        subprocess.run(["git", "clone", "--depth", "1", REPO_HTTPS, str(sub)], check=True)
+    else:
+        print("  git install failed, falling back to source archive...")
+        with tempfile.TemporaryDirectory() as tmp:
+            zip_path = Path(tmp) / "fungen.zip"
+            urllib.request.urlretrieve(REPO_ZIP, zip_path)
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(tmp)
+            extracted = next(p for p in Path(tmp).iterdir()
+                             if p.is_dir() and p.name.startswith("FunGen"))
+            shutil.move(str(extracted), str(sub))
+        print("  NOTE: installed without git, so the in-app updater will not work.")
+        print("        To enable updates later: install git, remove the FunGen folder,")
+        print("        and re-run install.")
+    if not (sub / "requirements" / "base.txt").exists():
+        sys.exit(f"FunGen source did not arrive at {sub}; aborting.")
+    return sub
+
+
+def _try_install_git() -> None:
+    """Install git via OS package manager. Non-fatal."""
+    sys_os = platform.system()
+    print("  git not found, attempting install...")
+    try:
+        if sys_os == "Windows":
+            if shutil.which("winget"):
+                subprocess.run(
+                    ["winget", "install", "-e", "--id", "Git.Git", "--silent",
+                     "--accept-source-agreements", "--accept-package-agreements"],
+                    check=True,
+                )
+                # winget puts git at C:\Program Files\Git\cmd\git.exe but
+                # doesn't refresh the current cmd session's PATH.
+                for p in (r"C:\Program Files\Git\cmd", r"C:\Program Files (x86)\Git\cmd"):
+                    if Path(p).exists():
+                        os.environ["PATH"] = p + os.pathsep + os.environ.get("PATH", "")
+                        break
+        elif sys_os == "Darwin":
+            if shutil.which("brew"):
+                subprocess.run(["brew", "install", "git"], check=True)
+        elif sys_os == "Linux":
+            for mgr, args in (
+                ("apt", ["sudo", "apt", "install", "-y", "git"]),
+                ("dnf", ["sudo", "dnf", "install", "-y", "git"]),
+                ("pacman", ["sudo", "pacman", "-S", "--noconfirm", "git"]),
+            ):
+                if shutil.which(mgr):
+                    subprocess.run(args, check=True)
+                    break
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+
+ROOT = _find_or_clone_project()
+VENV = ROOT / ".venv"
+PY_BIN = VENV / ("Scripts/python.exe" if WIN else "bin/python")
+CONDA_PROMPTED_MARKER = ROOT / ".fungen_conda_prompted"
+
+
+def _have(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
+
+
+def _run(*args, **kwargs) -> subprocess.CompletedProcess:
+    print(f"  $ {' '.join(str(a) for a in args)}", flush=True)
+    return subprocess.run(list(args), check=True, **kwargs)
+
+
+def _print_section(title: str) -> None:
+    print()
+    print(f"== {title} ==")
+
+
+# ─── uv bootstrap ───────────────────────────────────────────────────────────
+
+def ensure_uv() -> Path:
+    """Find or install uv. Falls back to `pip install uv` if astral.sh is unreachable."""
+    existing = shutil.which("uv")
+    if existing:
+        return Path(existing)
+
+    _print_section("Installing uv (one-time, ~15 MB)")
+    try:
+        if WIN:
+            _run("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-Command", "irm https://astral.sh/uv/install.ps1 | iex")
+        else:
+            _run("sh", "-c", "curl -LsSf https://astral.sh/uv/install.sh | sh")
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        print(f"  astral.sh installer unreachable ({exc}); trying pip fallback...")
+        _pip_install_uv_fallback()
+
+    uv = shutil.which("uv")
+    if not uv:
+        # uv installer drops the binary in standard locations the new shell hasn't picked up yet.
+        for cand in (
+            Path.home() / ".local" / "bin" / ("uv.exe" if WIN else "uv"),
+            Path.home() / ".cargo" / "bin" / ("uv.exe" if WIN else "uv"),
+        ):
+            if cand.exists():
+                return cand
+        sys.exit("Failed to locate uv after install. Install manually: pip install uv")
+    return Path(uv)
+
+
+def _pip_install_uv_fallback() -> None:
+    for py in ("python3", "python", "py"):
+        if not _have(py):
+            continue
+        try:
+            _run(py, "-m", "pip", "install", "--user", "uv")
+            return
+        except subprocess.CalledProcessError:
+            continue
+    sys.exit("Could not install uv via curl or pip. Check your internet connection.")
+
+
+# ─── GPU channel detection ──────────────────────────────────────────────────
+
+def detect_channel() -> str:
+    """Return the requirements/<channel>.txt name suffix to install."""
+    nvidia_cap = _nvidia_compute_cap()
+    nvidia_driver = _nvidia_driver_major()
+
+    # Blackwell GPU: needs cu129 wheels + driver 570+.
+    if nvidia_cap is not None and nvidia_cap >= 12.0:
+        return "cuda_blackwell"
+
+    # NVIDIA with a modern driver: cu128.
+    if nvidia_driver is not None and nvidia_driver >= 560:
+        return "cuda_stable"
+
+    # NVIDIA driver 550..559 (Debian Trixie, bookworm-backports): cu124.
+    if nvidia_driver is not None and nvidia_driver >= 550:
+        return "cuda_legacy"
+
+    # nvidia-smi ran but driver_version unreadable: fall back to GPU-name regex
+    # (matches the old detection path) and assume the driver is modern enough.
+    nvidia_name = _nvidia_gpu_name()
+    if nvidia_name:
+        if re.search(r"RTX\s*50\d{2}|Blackwell", nvidia_name, re.IGNORECASE):
+            return "cuda_blackwell"
+        if re.search(r"(RTX|GTX|Quadro|Tesla|A\d{2,}|H\d{2,}|L\d{2,})",
+                     nvidia_name, re.IGNORECASE):
+            return "cuda_stable"
+
+    if platform.system() == "Linux" and (_have("rocm-smi") or Path("/opt/rocm").exists()):
+        return "rocm"
+
+    if platform.system() == "Darwin" and _is_apple_silicon_host():
+        return "mps"
+
+    return "cpu"
+
+
+def _is_apple_silicon_host() -> bool:
+    # platform.machine() reflects the running Python's arch (x86_64 under
+    # Rosetta), not the host. sysctl reports the host CPU regardless.
+    if platform.machine().lower() in ("arm64", "aarch64"):
+        return True
+    try:
+        out = subprocess.check_output(
+            ["sysctl", "-n", "hw.optional.arm64"], stderr=subprocess.DEVNULL, text=True)
+        return out.strip() == "1"
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return False
+
+
+def _is_running_rosetta() -> bool:
+    return (platform.system() == "Darwin"
+            and _is_apple_silicon_host()
+            and platform.machine().lower() not in ("arm64", "aarch64"))
+
+
+def _switch_to_native_arm64() -> None:
+    # uv resolves wheels for the platform tag matching its own arch. Under
+    # x86_64 Python on an arm64 host the existing uv is x86_64 too (curl|sh
+    # detects via uname -m, which Rosetta returns as x86_64), so it asks
+    # PyPI for macosx_*_x86_64 torch wheels that no longer exist for 2.x.
+    # Reinstall uv as arm64 and re-exec ourselves under arch -arm64.
+    if not _is_running_rosetta():
+        return
+    home = os.environ.get("HOME", "")
+    if not home or not Path(home).is_dir():
+        sys.exit("HOME unset/invalid; re-run from a normal interactive shell.")
+    arch_bin = "/usr/bin/arch"
+    if not Path(arch_bin).exists():
+        sys.exit("Apple Silicon host with x86_64 Python but /usr/bin/arch is missing.")
+    _print_section("Switching to native arm64")
+    print("  x86_64 Python on Apple Silicon detected; reinstalling uv as arm64...")
+    try:
+        subprocess.run(
+            [arch_bin, "-arm64", "sh", "-c",
+             "curl -LsSf https://astral.sh/uv/install.sh | sh"],
+            check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        sys.exit(f"  Failed to install arm64 uv: {exc}")
+    arm64_uv = Path.home() / ".local" / "bin" / "uv"
+    if not arm64_uv.exists():
+        sys.exit(f"  arm64 uv not found at {arm64_uv} after install.")
+    # Force a managed arm64 Python; otherwise 'uv run --python 3.11' may pick
+    # an x86_64 system Python and re-Rosetta us into a re-exec loop.
+    try:
+        subprocess.run(
+            [arch_bin, "-arm64", str(arm64_uv), "python", "install", "3.11"],
+            check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        sys.exit(f"  Failed to install arm64 managed Python 3.11: {exc}")
+    # Make sure the re-execed install.py finds this uv first.
+    env = dict(os.environ)
+    env["PATH"] = f"{arm64_uv.parent}{os.pathsep}{env.get('PATH', '')}"
+    script = str(Path(__file__).resolve())
+    print(f"  re-execing under arch -arm64 via {arm64_uv}")
+    os.execvpe(
+        arch_bin,
+        [arch_bin, "-arm64", str(arm64_uv), "run",
+         "--no-project", "--python-preference", "only-managed",
+         "--python", "3.11", script, *sys.argv[1:]],
+        env)
+
+
+def _nvidia_compute_cap() -> float | None:
+    """Highest CUDA compute capability across attached NVIDIA GPUs, or None."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            text=True, stderr=subprocess.DEVNULL, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    caps: list[float] = []
+    for line in out.splitlines():
+        try:
+            caps.append(float(line.strip()))
+        except ValueError:
+            continue  # "N/A" on very old drivers
+    return max(caps) if caps else None
+
+
+def _nvidia_driver_major() -> int | None:
+    """Major integer of the installed NVIDIA driver, or None."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            text=True, stderr=subprocess.DEVNULL, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    majors: list[int] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            majors.append(int(line.split(".", 1)[0]))
+        except ValueError:
+            continue
+    return max(majors) if majors else None
+
+
+def _nvidia_gpu_name() -> str | None:
+    """First attached NVIDIA GPU name, or None."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            text=True, stderr=subprocess.DEVNULL, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    name = out.strip().split("\n", 1)[0].strip()
+    return name or None
+
+
+# ─── env build ──────────────────────────────────────────────────────────────
+
+def build_env(uv: Path, channel: str) -> None:
+    base_lock = ROOT / "requirements" / "base.txt"
+    channel_lock = ROOT / "requirements" / f"{channel}.txt"
+    if not base_lock.exists():
+        sys.exit(f"Missing requirements file: {base_lock}")
+    if not channel_lock.exists():
+        sys.exit(f"Missing requirements file: {channel_lock}")
+
+    _print_section(f"Creating Python 3.11 environment at {VENV}")
+    if VENV.exists():
+        shutil.rmtree(VENV)
+    # --seed installs pip into the venv. Required because the runtime
+    # dependency checker shells out to `python -m pip install ...` to
+    # auto-install missing packages after a `git pull`; without --seed,
+    # the venv has no pip and that call fails with "No module named pip".
+    _run(str(uv), "venv", "--python", "3.11", "--seed", str(VENV))
+
+    _print_section(f"Installing dependencies (channel: {channel})")
+    # unsafe-best-match: uv default (first-index) refuses to look at PyPI when
+    # a GPU lock file declares --index-url to the pytorch index, so packages
+    # like imgui (PyPI-only) fail to resolve. Pip behaves like best-match by
+    # default; this restores that for uv.
+    _run(str(uv), "pip", "install", "--python", str(PY_BIN),
+         "--index-strategy", "unsafe-best-match",
+         "-r", str(base_lock), "-r", str(channel_lock))
+
+
+# ─── conda cleanup prompt (one-shot) ────────────────────────────────────────
+
+def offer_conda_cleanup() -> None:
+    if CONDA_PROMPTED_MARKER.exists():
+        return
+
+    conda_root = Path.home() / "miniconda3"
+    fungen_env = conda_root / "envs" / "FunGen"
+    if not fungen_env.exists():
+        return
+
+    envs_dir = conda_root / "envs"
+    other_envs: list[Path] = []
+    if envs_dir.exists():
+        other_envs = [p for p in envs_dir.iterdir() if p.is_dir() and p.name != "FunGen"]
+
+    _print_section("Legacy miniconda environment detected")
+    print(f"Found a previous FunGen conda env at: {fungen_env}")
+
+    if other_envs:
+        print(f"Your miniconda also has {len(other_envs)} other env(s) — those won't be touched.")
+        print()
+        print("  [y] Remove just the FunGen conda env  (frees ~2 GB)")
+        print("  [n] Keep it as a fallback              (default)")
+        choice = _ask("Choice [y/N]: ", default="n")
+        if choice == "y":
+            print(f"  Removing {fungen_env}...")
+            shutil.rmtree(fungen_env, ignore_errors=True)
+            print("  Done. Other conda envs and miniconda itself are untouched.")
+    else:
+        size_gb = _dir_size_gb(conda_root)
+        print("If miniconda was installed specifically for FunGen (no other envs"
+              " in it), you may safely remove it.")
+        print()
+        print("  [1] Remove just the FunGen conda env   (keeps miniconda for future use)")
+        print(f"  [2] Remove all of miniconda            (frees ~{size_gb:.1f} GB)")
+        print("  [n] Keep everything                    (default)")
+        choice = _ask("Choice [1/2/n]: ", default="n")
+        if choice == "1":
+            print(f"  Removing {fungen_env}...")
+            shutil.rmtree(fungen_env, ignore_errors=True)
+        elif choice == "2":
+            print(f"  Removing {conda_root}...")
+            shutil.rmtree(conda_root, ignore_errors=True)
+
+    CONDA_PROMPTED_MARKER.touch()
+
+
+def _ask(prompt: str, default: str) -> str:
+    if not sys.stdin or not sys.stdin.isatty():
+        return default
+    try:
+        ans = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return default
+    return ans or default
+
+
+def _dir_size_gb(path: Path) -> float:
+    total = 0
+    for root, _, files in os.walk(path, followlinks=False):
+        for f in files:
+            try:
+                total += (Path(root) / f).stat().st_size
+            except OSError:
+                pass
+    return total / (1024 ** 3)
+
+
+# ─── ffmpeg via system package manager (non-fatal) ──────────────────────────
+
+def ensure_ffmpeg() -> None:
+    """Try to install ffmpeg via the OS package manager. Non-fatal: prints a
+    manual-install hint and returns if no automated path works."""
+    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+        return
+
+    _print_section("ffmpeg not found, attempting install")
+    sys_os = platform.system()
+    try:
+        if sys_os == "Windows":
+            if shutil.which("winget"):
+                _run("winget", "install", "-e", "--id", "Gyan.FFmpeg",
+                     "--silent", "--accept-source-agreements",
+                     "--accept-package-agreements")
+            else:
+                print("  winget not found. Install ffmpeg manually:")
+                print("    https://www.gyan.dev/ffmpeg/builds/  (download the 'release essentials' zip,")
+                print("    extract, and add the bin/ folder to your system PATH).")
+                return
+        elif sys_os == "Darwin":
+            if shutil.which("brew"):
+                _run("brew", "install", "ffmpeg")
+            else:
+                print("  Homebrew not found. Install ffmpeg manually:  brew install ffmpeg")
+                print("  (install Homebrew from https://brew.sh first if you don't have it).")
+                return
+        elif sys_os == "Linux":
+            for mgr_check, args in (
+                ("apt", ["sudo", "apt", "install", "-y", "ffmpeg"]),
+                ("dnf", ["sudo", "dnf", "install", "-y", "ffmpeg"]),
+                ("pacman", ["sudo", "pacman", "-S", "--noconfirm", "ffmpeg"]),
+            ):
+                if shutil.which(mgr_check):
+                    _run(*args)
+                    break
+            else:
+                print("  no supported package manager found; install ffmpeg via your distro's tools.")
+                return
+        else:
+            print(f"  unsupported OS ({sys_os}); install ffmpeg manually.")
+            return
+    except subprocess.CalledProcessError as e:
+        print(f"  ffmpeg install failed: {e}")
+        print("  FunGen will still launch but video features will not work until ffmpeg is on PATH.")
+
+
+# ─── mpv via system package manager (non-fatal) ─────────────────────────────
+
+def _ensure_libmpv_windows() -> bool:
+    """Fetch libmpv-2.dll into <ROOT>/lib/. Shinchiro's player package (what
+    winget installs) ships only mpv.exe; libmpv-2.dll lives in their dev SDK.
+    Windows 10 1803+ ships tar.exe (bsdtar/libarchive), which reads the BCJ2
+    filter the dev SDK uses, so no extra extractor is needed."""
+    target = ROOT / "lib" / "libmpv-2.dll"
+    if target.is_file():
+        return True
+    api = "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest"
+    try:
+        with urllib.request.urlopen(api, timeout=15) as r:
+            release = json.load(r)
+    except Exception as e:
+        print(f"  github api unreachable: {e}")
+        return False
+    # Skip the -v3 variant: it requires AVX2 / BMI2 (Haswell+ / Zen+) and
+    # crashes on older cpus. Match the plain x86_64 build whose name has a
+    # digit right after the architecture token.
+    asset = next((a for a in release.get("assets", [])
+                  if re.match(r"^mpv-dev-x86_64-\d", a.get("name", ""))
+                  and a["name"].endswith(".7z")), None)
+    if not asset:
+        print("  no mpv-dev-x86_64 asset in latest shinchiro release")
+        return False
+    archive = Path(tempfile.gettempdir()) / asset["name"]
+    print(f"  downloading {asset['name']} ({asset.get('size', 0) // (1024*1024)} MB)")
+    try:
+        urllib.request.urlretrieve(asset["browser_download_url"], archive)
+    except Exception as e:
+        print(f"  download failed: {e}")
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        r = subprocess.run(
+            ["tar", "-xf", str(archive), "-C", str(target.parent), "libmpv-2.dll"],
+            capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        print(f"  tar extract failed: {e}")
+        return False
+    finally:
+        try:
+            archive.unlink()
+        except OSError:
+            pass
+    if r.returncode != 0:
+        print(f"  tar exit {r.returncode}: {r.stderr.strip()[:200]}")
+        return False
+    return target.is_file() and target.stat().st_size > 50_000_000
+
+
+def ensure_mpv() -> None:
+    """Try to install mpv via the OS package manager. Non-fatal: prints a
+    manual-install hint and returns if no automated path works.
+    FunGen spawns `mpv` as a subprocess for fullscreen review playback."""
+    if shutil.which("mpv"):
+        # On Windows, mpv.exe alone is not enough: the python-mpv binding
+        # needs libmpv-2.dll, which the shinchiro.mpv winget package does
+        # not ship. Always check + fetch if the dll is missing.
+        if platform.system() == "Windows":
+            target = ROOT / "lib" / "libmpv-2.dll"
+            if not target.is_file():
+                _print_section("libmpv-2.dll missing, fetching dev SDK")
+                if _ensure_libmpv_windows():
+                    print(f"  libmpv-2.dll installed at {target}")
+                else:
+                    print("  auto-fetch failed. To install libmpv-2.dll manually:")
+                    print("    1. Download mpv-dev-x86_64-v3 from")
+                    print("       https://github.com/shinchiro/mpv-winbuild-cmake/releases/latest")
+                    print("    2. Extract libmpv-2.dll from the .7z archive")
+                    print(f"    3. Place it at: {target}")
+        return
+
+    _print_section("mpv not found, attempting install")
+    sys_os = platform.system()
+    try:
+        if sys_os == "Windows":
+            if shutil.which("winget"):
+                _run("winget", "install", "-e", "--id", "shinchiro.mpv",
+                     "--silent", "--accept-source-agreements",
+                     "--accept-package-agreements")
+                # winget gives us mpv.exe; libmpv-2.dll comes from the dev SDK.
+                print()
+                print("  mpv.exe installed via winget. fetching libmpv-2.dll...")
+                if _ensure_libmpv_windows():
+                    print(f"  libmpv-2.dll installed at {ROOT / 'lib' / 'libmpv-2.dll'}")
+                else:
+                    print("  auto-fetch failed. To install libmpv-2.dll manually:")
+                    print("    1. Download mpv-dev-x86_64-v3 from")
+                    print("       https://github.com/shinchiro/mpv-winbuild-cmake/releases/latest")
+                    print("    2. Extract libmpv-2.dll from the .7z archive")
+                    print(f"    3. Place it at: {ROOT / 'lib' / 'libmpv-2.dll'}")
+            else:
+                print("  winget not found.")
+                print("  Install mpv manually so BOTH mpv.exe AND libmpv-2.dll land in the same folder on PATH.")
+                print("  Pre-built bundle that ships both: https://github.com/zhongfly/mpv-winbuild/releases")
+                print("  (extract, then add the folder containing mpv.exe + libmpv-2.dll to your PATH).")
+                return
+        elif sys_os == "Darwin":
+            if shutil.which("brew"):
+                _run("brew", "install", "mpv")
+            else:
+                print("  Homebrew not found. Install mpv manually:  brew install mpv")
+                print("  (install Homebrew from https://brew.sh first if you don't have it).")
+                return
+        elif sys_os == "Linux":
+            for mgr_check, args in (
+                ("apt", ["sudo", "apt", "install", "-y", "mpv"]),
+                ("dnf", ["sudo", "dnf", "install", "-y", "mpv"]),
+                ("pacman", ["sudo", "pacman", "-S", "--noconfirm", "mpv"]),
+            ):
+                if shutil.which(mgr_check):
+                    _run(*args)
+                    break
+            else:
+                print("  no supported package manager found; install mpv via your distro's tools.")
+                return
+        else:
+            print(f"  unsupported OS ({sys_os}); install mpv manually.")
+            return
+    except subprocess.CalledProcessError as e:
+        print(f"  mpv install failed: {e}")
+        print("  FunGen will still launch but fullscreen video playback will not work.")
+
+
+# ─── per-OS launch hint ─────────────────────────────────────────────────────
+
+def print_launch_hint() -> None:
+    sys_os = platform.system()
+    print()
+    print("=" * 60)
+    print("Done. Launch FunGen with:")
+    if sys_os == "Windows":
+        print("  Double-click  launch.bat")
+    elif sys_os == "Darwin":
+        print("  Double-click  launch.command   (Finder)")
+        print("  Or run        ./launch.sh      (Terminal)")
+    else:
+        print("  ./launch.sh")
+    print("=" * 60)
+
+
+# ─── entry point ────────────────────────────────────────────────────────────
+
+def main() -> None:
+    _switch_to_native_arm64()  # never returns if a re-exec happens
+    _print_section("FunGen installer")
+    print(f"  platform: {platform.system()} {platform.machine()}")
+    print(f"  project:  {ROOT}")
+
+    uv = ensure_uv()
+    print(f"  uv:       {uv}")
+
+    channel = detect_channel()
+    print(f"  channel:  {channel}")
+
+    build_env(uv, channel)
+    ensure_ffmpeg()
+    ensure_mpv()
+    offer_conda_cleanup()
+    print_launch_hint()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit("\nAborted.")
